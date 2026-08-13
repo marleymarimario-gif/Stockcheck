@@ -11,12 +11,17 @@ alter table public.stock_ins add column if not exists corrected_at timestamptz;
 drop policy if exists "workspace corrects stock ins" on public.stock_ins;
 revoke update on public.stock_ins from authenticated;
 
-create or replace function public.correct_stock_in(
+drop function if exists public.correct_stock_in(uuid, bigint, uuid, integer, text);
+drop function if exists public.correct_stock_in(uuid, bigint, uuid, integer, text, text, text);
+
+create function public.correct_stock_in(
   target_workspace uuid,
   target_stock_in bigint,
   target_product uuid,
   target_quantity integer,
-  target_unit_mode text
+  target_unit_mode text,
+  target_product_name text,
+  target_category text
 ) returns boolean language plpgsql security definer set search_path = public
 as $$
 declare
@@ -25,18 +30,21 @@ declare
   target_unit text;
   target_units integer;
 begin
-  if auth.uid() is null or target_quantity <= 0 or target_unit_mode not in ('package', 'base') then
+  if auth.uid() is null or target_quantity <= 0 or target_unit_mode not in ('package', 'base')
+    or trim(target_product_name) = '' or trim(target_category) = '' then
     raise exception 'Invalid correction';
   end if;
   select * into original_entry from public.stock_ins
   where id = target_stock_in and workspace_id = target_workspace;
   if not found or not public.is_workspace_member(target_workspace)
-    or (original_entry.added_by <> auth.uid() and not public.is_workspace_admin(target_workspace)) then
+    or (original_entry.added_by is distinct from auth.uid() and not public.is_workspace_admin(target_workspace)) then
     raise exception 'Not allowed';
   end if;
   select pack_size, unit into target_pack_size, target_unit from public.products
   where id = target_product and workspace_id = target_workspace;
   if not found then raise exception 'Invalid product'; end if;
+  update public.products set name = trim(target_product_name), category = trim(target_category)
+  where id = target_product and workspace_id = target_workspace;
   target_units := case when target_unit_mode = 'package' then target_quantity * target_pack_size else target_quantity end;
   update public.stock_ins set
     corrected_product_id = target_product,
@@ -51,8 +59,8 @@ begin
   return true;
 end $$;
 
-revoke all on function public.correct_stock_in(uuid, bigint, uuid, integer, text) from public;
-grant execute on function public.correct_stock_in(uuid, bigint, uuid, integer, text) to authenticated;
+revoke all on function public.correct_stock_in(uuid, bigint, uuid, integer, text, text, text) from public;
+grant execute on function public.correct_stock_in(uuid, bigint, uuid, integer, text, text, text) to authenticated;
 
 drop view if exists public.recent_activity;
 drop view if exists public.inventory_current;
