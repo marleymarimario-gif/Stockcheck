@@ -129,7 +129,7 @@ create policy "workspace adds stock ins" on public.stock_ins for insert to authe
 drop view if exists public.recent_activity;
 drop view if exists public.inventory_current;
 create view public.inventory_current with (security_invoker = true) as
-select p.workspace_id, p.id, p.category, p.brand, p.flavor, p.name, p.spec, p.unit,
+select p.workspace_id, p.id, p.category, p.subcategory, p.brand, p.flavor, p.name, p.spec, p.unit,
   p.pack_size, p.low_stock_level, p.sort_order, latest.quantity as latest_quantity,
   latest.stocktake_date, latest.counted_by_email,
   coalesce(sum(si.units_added) filter (where latest.created_at is null or si.added_at > latest.created_at), 0)::integer as stock_in_after_count,

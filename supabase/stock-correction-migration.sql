@@ -7,12 +7,14 @@ alter table public.stock_ins add column if not exists corrected_entered_unit tex
 alter table public.stock_ins add column if not exists corrected_by uuid references auth.users(id);
 alter table public.stock_ins add column if not exists corrected_by_email text;
 alter table public.stock_ins add column if not exists corrected_at timestamptz;
+alter table public.products add column if not exists subcategory text not null default '未分類';
 
 drop policy if exists "workspace corrects stock ins" on public.stock_ins;
 revoke update on public.stock_ins from authenticated;
 
 drop function if exists public.correct_stock_in(uuid, bigint, uuid, integer, text);
 drop function if exists public.correct_stock_in(uuid, bigint, uuid, integer, text, text, text);
+drop function if exists public.correct_stock_in(uuid, bigint, uuid, integer, text, text, text, text);
 
 create function public.correct_stock_in(
   target_workspace uuid,
@@ -21,7 +23,8 @@ create function public.correct_stock_in(
   target_quantity integer,
   target_unit_mode text,
   target_product_name text,
-  target_category text
+  target_category text,
+  target_subcategory text
 ) returns boolean language plpgsql security definer set search_path = public
 as $$
 declare
@@ -31,7 +34,7 @@ declare
   target_units integer;
 begin
   if auth.uid() is null or target_quantity <= 0 or target_unit_mode not in ('package', 'base')
-    or trim(target_product_name) = '' or trim(target_category) = '' then
+    or trim(target_product_name) = '' or trim(target_category) = '' or trim(target_subcategory) = '' then
     raise exception 'Invalid correction';
   end if;
   select * into original_entry from public.stock_ins
@@ -43,7 +46,7 @@ begin
   select pack_size, unit into target_pack_size, target_unit from public.products
   where id = target_product and workspace_id = target_workspace;
   if not found then raise exception 'Invalid product'; end if;
-  update public.products set name = trim(target_product_name), category = trim(target_category)
+  update public.products set name = trim(target_product_name), category = trim(target_category), subcategory = trim(target_subcategory)
   where id = target_product and workspace_id = target_workspace;
   target_units := case when target_unit_mode = 'package' then target_quantity * target_pack_size else target_quantity end;
   update public.stock_ins set
@@ -59,14 +62,14 @@ begin
   return true;
 end $$;
 
-revoke all on function public.correct_stock_in(uuid, bigint, uuid, integer, text, text, text) from public;
-grant execute on function public.correct_stock_in(uuid, bigint, uuid, integer, text, text, text) to authenticated;
+revoke all on function public.correct_stock_in(uuid, bigint, uuid, integer, text, text, text, text) from public;
+grant execute on function public.correct_stock_in(uuid, bigint, uuid, integer, text, text, text, text) to authenticated;
 
 drop view if exists public.recent_activity;
 drop view if exists public.inventory_current;
 
 create view public.inventory_current with (security_invoker = true) as
-select p.workspace_id, p.id, p.category, p.brand, p.flavor, p.name, p.spec, p.unit,
+select p.workspace_id, p.id, p.category, p.subcategory, p.brand, p.flavor, p.name, p.spec, p.unit,
   p.pack_size, p.low_stock_level, p.sort_order, latest.quantity as latest_quantity,
   latest.stocktake_date, latest.counted_by_email,
   coalesce(sum(coalesce(si.corrected_units, si.units_added)) filter (

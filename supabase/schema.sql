@@ -5,6 +5,7 @@ create table if not exists public.products (
   id uuid primary key default gen_random_uuid(),
   legacy_id text unique,
   category text not null,
+  subcategory text not null default '未分類',
   brand text not null,
   flavor text not null,
   name text not null,
@@ -72,7 +73,7 @@ create policy "team adds stock ins" on public.stock_ins for insert to authentica
 create or replace view public.inventory_current
 with (security_invoker = true) as
 select
-  p.id, p.category, p.brand, p.flavor, p.name, p.spec, p.unit,
+  p.id, p.category, p.subcategory, p.brand, p.flavor, p.name, p.spec, p.unit,
   p.pack_size, p.low_stock_level, p.sort_order,
   latest.quantity as latest_quantity,
   latest.stocktake_date,
