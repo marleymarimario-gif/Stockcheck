@@ -27,7 +27,7 @@ type OcrProgress = { label: string; percent: number };
 
 const today = () => new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Hong_Kong" });
 const publisherId = import.meta.env.VITE_ADSENSE_PUBLISHER_ID ?? "";
-const appVersion = "2026.08.14.5";
+const appVersion = "2026.08.14.6";
 
 function useLatestAppVersion() {
   useEffect(() => {
@@ -217,6 +217,85 @@ function documentProductMatches(text: string, items: RecognizableProduct[]) {
     }
   });
   return [...chosen.entries()].sort((a, b) => a[1].lineIndex - b[1].lineIndex).map(([productId]) => productId);
+}
+
+function bestRecognizedProduct(text: string, items: RecognizableProduct[]) {
+  const normalized = normalizeOcr(text); if (!normalized) return null;
+  const ranked = items.map((item) => {
+    const aliases = recognitionAliases(item);
+    const weights = [5, aliases[1]?.length >= 3 ? 4 : 2, 10, 1];
+    const score = aliases.reduce((total, alias, index) => total + (normalized.includes(alias) ? (weights[index] ?? 7) : 0), 0);
+    return { item, score };
+  }).sort((a, b) => b.score - a.score);
+  const best = ranked[0]; const second = ranked[1];
+  return best && best.score >= 6 && (!second || best.score - second.score >= 2 || best.score >= 10) ? best.item : null;
+}
+
+const ignoredOcrLine = /(?:[$€¥]|貨品清單|再次購買|優惠碼|折扣|合計|總計|小計|送貨|收貨|地址|電話|付款|訂單編號|order\s*(?:no|number)|subtotal|total|delivery|payment|aughd)/i;
+
+function looksLikeProductText(value: string) {
+  const text = value.replace(/\s+/g, " ").trim(); const normalized = normalizeOcr(text);
+  const letters = [...text.matchAll(/[\p{L}]/gu)].length;
+  return normalized.length >= 7 && letters >= 5 && !ignoredOcrLine.test(text);
+}
+
+function draftFromOcr(value: string): ProductDraft {
+  const name = value.replace(/(?:^|\s)\d{1,3}\s*$/, "").replace(/\s+/g, " ").trim();
+  const spec = name.match(/\d+(?:\.\d+)?\s*(?:g|kg|克|公斤|ml|l|毫升|公升)(?:\s*[x×]\s*\d{1,3})?|\d{1,3}\s*[x×]\s*\d+(?:\.\d+)?\s*(?:g|kg|克|公斤|ml|l|毫升|公升)/i)?.[0] ?? "";
+  const leadingPack = spec.match(/^(\d{1,3})\s*[x×]/i)?.[1];
+  const trailingPack = spec.match(/[x×]\s*(\d{1,3})$/i)?.[1];
+  const packSize = Math.max(1, Number(leadingPack ?? trailingPack ?? 1));
+  const category = /薯片|脆片|potato|chips/i.test(name) ? "薯片／脆片"
+    : /朱古力|巧克力|chocolate|m&m|maltesers|kitkat/i.test(name) ? "朱古力"
+    : /糖果|橡皮糖|gummy|candy/i.test(name) ? "糖果"
+    : /餅|cookie|biscuit|cracker/i.test(name) ? "餅乾／米餅"
+    : /咖啡|coffee/i.test(name) ? "咖啡"
+    : /水|汽水|飲料|飲品|cola|soda|energy|ml|毫升/i.test(name) ? "飲品"
+    : "未分類";
+  return { category, brand: "待核對", flavor: "待核對", name: name || "未命名產品", spec, unit: "件", pack_size: packSize, low_stock_level: 0 };
+}
+
+function mergeDetectedLines(primary: PdfLine[], secondary: PdfLine[]) {
+  const keys = new Set(primary.map((line) => line.productId || normalizeOcr(line.draft?.name ?? "")));
+  return [...primary, ...secondary.filter((line) => {
+    const key = line.productId || normalizeOcr(line.draft?.name ?? "");
+    if (!key || keys.has(key)) return false; keys.add(key); return true;
+  })];
+}
+
+function genericDocumentLines(text: string, items: RecognizableProduct[]) {
+  const rawLines = text.split(/\r?\n/).map((line) => line.normalize("NFKC").replace(/\s+/g, " ").trim()).filter(Boolean);
+  const results: PdfLine[] = []; const used = new Set<string>();
+  rawLines.forEach((line, lineIndex) => {
+    if (!looksLikeProductText(line)) return;
+    for (let span = 1; span <= 4 && lineIndex + span <= rawLines.length; span++) {
+      const window = rawLines.slice(lineIndex, lineIndex + span).join(" ");
+      const quantity = Number(window.match(/(?:^|\s)(\d{1,3})\s*$/)?.[1] ?? 0);
+      const productText = window.replace(/(?:^|\s)\d{1,3}\s*$/, "").trim();
+      if (!quantity || !looksLikeProductText(productText)) continue;
+      const recognized = bestRecognizedProduct(productText, items);
+      const draft = recognized ? undefined : draftFromOcr(productText);
+      const key = recognized?.id ?? normalizeOcr(draft?.name ?? "");
+      if (!key || used.has(key)) break;
+      used.add(key); results.push({ productId: recognized?.id ?? "", pieces: quantity, unitMode: "package", draft });
+      break;
+    }
+  });
+  return results;
+}
+
+function genericImageLines(text: string, quantities: number[], items: RecognizableProduct[]) {
+  if (!quantities.length) return [];
+  const rows = text.split(/\r?\n/).map((line) => line.normalize("NFKC").replace(/\s+/g, " ").trim())
+    .filter((line) => looksLikeProductText(line));
+  const results: PdfLine[] = []; const used = new Set<string>();
+  for (const row of rows) {
+    const recognized = bestRecognizedProduct(row, items); const draft = recognized ? undefined : draftFromOcr(row);
+    const key = recognized?.id ?? normalizeOcr(draft?.name ?? ""); if (!key || used.has(key)) continue;
+    used.add(key); results.push({ productId: recognized?.id ?? "", pieces: quantities[results.length], unitMode: "package", draft });
+    if (results.length === quantities.length) break;
+  }
+  return results;
 }
 
 async function imageQuantityColumn(source: File) {
@@ -445,16 +524,19 @@ function Stockcheck({ session, workspace, workspaces, changeWorkspace, reloadWor
       }
       setOcrProgress({ label: "配對產品及數量", percent: 100 });
       const productMatches = isImage ? documentProductMatches(text, candidates) : [];
-      const detectedMatches = imageQuantities.length && productMatches.length
+      const knownMatches = imageQuantities.length && productMatches.length
         ? productMatches.slice(0, imageQuantities.length).map((productId, index) => ({ productId, pieces: imageQuantities[index], unitMode: "package" as UnitMode }))
         : documentMatches(text, candidates);
+      const genericMatches = isImage ? genericImageLines(text, imageQuantities, candidates) : genericDocumentLines(text, candidates);
+      const detectedMatches = isImage ? mergeDetectedLines(genericMatches, knownMatches) : mergeDetectedLines(knownMatches, genericMatches);
       const matches = detectedMatches.map((line) => {
         const template = catalogItems.find((item) => item.id === line.productId);
         if (!template) return line;
         return { ...line, productId: "", draft: { category: template.category, brand: template.brand, flavor: template.flavor, name: template.name, spec: template.spec, unit: template.unit, pack_size: template.pack_size, low_stock_level: 0 } };
       });
       setPdf({ filename: file.name, orderNumber: text.replace(/\s/g, "").match(/H\d{12}/i)?.[0]?.toUpperCase() ?? "", lines: matches });
-      setToast(matches.length ? `已辨認 ${matches.length} 款，請逐項核對` : "未能自動配對，請喺核對頁手動加入產品");
+      const newCount = matches.filter((line) => line.draft).length;
+      setToast(matches.length ? `已辨認 ${matches.length} 款${newCount ? `（${newCount} 款新產品）` : ""}，請逐項核對` : "未能擷取產品行，請喺核對頁手動加入產品");
     } catch (error) { console.error("Document import failed", { stage: failureStage, error }); setToast(`未能讀取檔案（${failureStage}），請重試`); }
     finally { setPdfBusy(false); setOcrProgress(null); if (fileRef.current) fileRef.current.value = ""; }
   };
