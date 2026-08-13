@@ -107,3 +107,5 @@ select * from (
 ) activity order by happened_at desc limit 30;
 
 grant select on public.recent_activity to authenticated;
+
+-- For workspace isolation, also run workspace-migration.sql after this base schema.
