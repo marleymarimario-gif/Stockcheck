@@ -17,7 +17,7 @@ type ProductDraft = {
   category: string; brand: string; flavor: string; name: string; spec: string;
   unit: string; pack_size: number; low_stock_level: number;
 };
-type PdfLine = { productId: string; pieces: number; unitMode: UnitMode; draft?: ProductDraft };
+type PdfLine = { productId: string; pieces: number | ""; unitMode: UnitMode; draft?: ProductDraft };
 type RecognizableProduct = Pick<InventoryItem, "id" | "category" | "brand" | "flavor" | "name" | "spec" | "unit" | "pack_size">;
 type NewProduct = {
   category: string; brand: string; flavor: string; name: string; spec: string;
@@ -27,7 +27,7 @@ type OcrProgress = { label: string; percent: number };
 
 const today = () => new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Hong_Kong" });
 const publisherId = import.meta.env.VITE_ADSENSE_PUBLISHER_ID ?? "";
-const appVersion = "2026.08.14.6";
+const appVersion = "2026.08.14.7";
 
 function useLatestAppVersion() {
   useEffect(() => {
@@ -551,10 +551,11 @@ function Stockcheck({ session, workspace, workspaces, changeWorkspace, reloadWor
       if (productError || created?.length !== newLines.length) { setBusy(null); return setToast("未能由訂單建立新產品，庫存未有更新"); }
       newLines.forEach((line, index) => createdIds.set(pdf.lines.indexOf(line), created[index].id));
     }
-    const rows = pdf.lines.filter((line) => line.pieces > 0).map((line, index) => {
+    const rows = pdf.lines.filter((line) => Number(line.pieces) > 0).map((line, index) => {
       const item = line.draft ?? items.find((entry) => entry.id === line.productId)!;
-      const unitsAdded = line.unitMode === "package" ? line.pieces * item.pack_size : line.pieces;
-      return { workspace_id: workspace.id, product_id: line.draft ? createdIds.get(index)! : line.productId, pieces: line.unitMode === "package" ? line.pieces : 1, units_added: unitsAdded, entered_quantity: line.pieces, entered_unit: line.unitMode === "package" ? "箱／包" : item.unit, source: `上載檔案: ${pdf.filename}`, order_number: pdf.orderNumber || null, added_by: session.user.id, added_by_email: session.user.email };
+      const enteredQuantity = Number(line.pieces);
+      const unitsAdded = line.unitMode === "package" ? enteredQuantity * item.pack_size : enteredQuantity;
+      return { workspace_id: workspace.id, product_id: line.draft ? createdIds.get(index)! : line.productId, pieces: line.unitMode === "package" ? enteredQuantity : 1, units_added: unitsAdded, entered_quantity: enteredQuantity, entered_unit: line.unitMode === "package" ? "箱／包" : item.unit, source: `上載檔案: ${pdf.filename}`, order_number: pdf.orderNumber || null, added_by: session.user.id, added_by_email: session.user.email };
     });
     const { error } = await supabase.from("stock_ins").insert(rows);
     setBusy(null); if (error) return setToast(error.code === "23505" ? "呢張訂單已經入過貨" : "未能確認檔案入貨");
@@ -649,7 +650,7 @@ function WorkspaceDialog({ session, workspace, workspaces, changeWorkspace, relo
 
 function UploadReview({ pdf, items, setPdf, confirm, busy }: { pdf: { filename: string; orderNumber: string; lines: PdfLine[] }; items: InventoryItem[]; setPdf: (value: typeof pdf | null) => void; confirm: () => void; busy: boolean }) {
   const lineProduct = (line: PdfLine) => line.draft ?? items.find((entry) => entry.id === line.productId);
-  const totalUnits = pdf.lines.reduce((sum, line) => { const item = lineProduct(line); return sum + (line.unitMode === "package" ? line.pieces * (item?.pack_size ?? 0) : line.pieces); }, 0);
+  const totalUnits = pdf.lines.reduce((sum, line) => { const item = lineProduct(line); const quantity = Number(line.pieces || 0); return sum + (line.unitMode === "package" ? quantity * (item?.pack_size ?? 0) : quantity); }, 0);
   const updateLine = (index: number, next: Partial<PdfLine>) => { const lines = [...pdf.lines]; lines[index] = { ...lines[index], ...next }; setPdf({ ...pdf, lines }); };
   const updateDraft = (index: number, key: keyof ProductDraft, value: string | number) => {
     const line = pdf.lines[index]; if (!line.draft) return;
@@ -659,13 +660,13 @@ function UploadReview({ pdf, items, setPdf, confirm, busy }: { pdf: { filename: 
   const addLine = () => setPdf({ ...pdf, lines: [...pdf.lines, items[0]
     ? { productId: items[0].id, pieces: 1, unitMode: "package" }
     : { productId: "", pieces: 1, unitMode: "package", draft: { category: "其他", brand: "", flavor: "原味", name: "", spec: "", unit: "件", pack_size: 1, low_stock_level: 0 } }] });
-  const invalid = pdf.lines.some((line) => line.pieces <= 0 || (!line.draft && !line.productId) || (line.draft && (![line.draft.category, line.draft.brand, line.draft.flavor, line.draft.name, line.draft.unit].every((value) => value.trim()) || line.draft.pack_size < 1)));
+  const invalid = pdf.lines.some((line) => Number(line.pieces) <= 0 || (!line.draft && !line.productId) || (line.draft && (![line.draft.category, line.draft.brand, line.draft.flavor, line.draft.name, line.draft.unit].every((value) => value.trim()) || line.draft.pack_size < 1)));
   return <div className="review-page">
     <header className="review-topbar"><button onClick={() => setPdf(null)}>← 取消</button><div><p className="eyebrow">未更新庫存</p><h2>資料核對</h2></div><span>{pdf.lines.length} 項</span></header>
     <section className="review-summary"><div><span>上載檔案</span><strong>{pdf.filename}</strong></div><label>訂單編號<input value={pdf.orderNumber} onChange={(event) => setPdf({ ...pdf, orderNumber: event.target.value })} placeholder="如有訂單編號請填寫" /></label><div className="review-totals"><span>辨認項目 <b>{pdf.lines.length}</b></span><span>預計新增 <b>{totalUnits}</b> 件</span></div></section>
     <section className="review-list"><div className="review-heading"><div><p className="eyebrow">逐項確認</p><h3>產品及數量</h3></div><button className="outline-button" onClick={addLine}>＋ 加漏咗嘅貨</button></div>
       {!pdf.lines.length && <div className="empty-card"><strong>未辨認到產品</strong><p>按「加漏咗嘅貨」手動加入，再確認入庫。</p></div>}
-      {pdf.lines.map((line, index) => { const item = lineProduct(line); const converted = line.unitMode === "package" ? line.pieces * (item?.pack_size ?? 0) : line.pieces; return <article className="review-item" key={`${index}-${line.productId}`}><div className="review-item-number">{index + 1}</div><div className="review-fields">{line.draft ? <div className="generated-product"><div className="generated-product-title"><span>PDF 自動建立新產品</span><b>請核對</b></div><div className="two-fields"><label>種類<input value={line.draft.category} onChange={(event) => updateDraft(index, "category", event.target.value)} /></label><label>品牌<input value={line.draft.brand} onChange={(event) => updateDraft(index, "brand", event.target.value)} /></label></div><div className="two-fields"><label>味道<input value={line.draft.flavor} onChange={(event) => updateDraft(index, "flavor", event.target.value)} /></label><label>產品名稱<input value={line.draft.name} onChange={(event) => updateDraft(index, "name", event.target.value)} /></label></div><div className="three-fields"><label>規格<input value={line.draft.spec} onChange={(event) => updateDraft(index, "spec", event.target.value)} /></label><label>基本單位<input value={line.draft.unit} onChange={(event) => updateDraft(index, "unit", event.target.value)} /></label><label>每箱／包數量<input inputMode="numeric" value={line.draft.pack_size} onChange={(event) => updateDraft(index, "pack_size", Math.max(1, Number(event.target.value.replace(/\D/g, ""))))} /></label></div></div> : <label>現有產品<select value={line.productId} onChange={(event) => updateLine(index, { productId: event.target.value })}>{items.map((entry) => <option key={entry.id} value={entry.id}>{entry.category}｜{entry.brand}｜{entry.flavor}</option>)}</select></label>}<div className="review-quantity"><label>數量<input inputMode="numeric" value={line.pieces} onChange={(event) => updateLine(index, { pieces: Math.max(0, Number(event.target.value.replace(/\D/g, ""))) })} /></label><label>輸入單位<select value={line.unitMode} onChange={(event) => updateLine(index, { unitMode: event.target.value as UnitMode })}><option value="package">箱／包</option><option value="base">{item?.unit ?? "件"}</option></select></label><div><span>自動換算</span><strong>{converted} {item?.unit}</strong></div></div></div><button className="remove-button" onClick={() => removeLine(index)} aria-label="刪除項目">×</button></article>; })}
+      {pdf.lines.map((line, index) => { const item = lineProduct(line); const quantity = Number(line.pieces || 0); const converted = line.unitMode === "package" ? quantity * (item?.pack_size ?? 0) : quantity; return <article className="review-item" key={`${index}-${line.productId}`}><div className="review-item-number">{index + 1}</div><div className="review-fields">{line.draft ? <div className="generated-product"><div className="generated-product-title"><span>PDF 自動建立新產品</span><b>請核對</b></div><div className="two-fields"><label>種類<input value={line.draft.category} onChange={(event) => updateDraft(index, "category", event.target.value)} /></label><label>品牌<input value={line.draft.brand} onChange={(event) => updateDraft(index, "brand", event.target.value)} /></label></div><div className="two-fields"><label>味道<input value={line.draft.flavor} onChange={(event) => updateDraft(index, "flavor", event.target.value)} /></label><label>產品名稱<input value={line.draft.name} onChange={(event) => updateDraft(index, "name", event.target.value)} /></label></div><div className="three-fields"><label>規格<input value={line.draft.spec} onChange={(event) => updateDraft(index, "spec", event.target.value)} /></label><label>基本單位<input value={line.draft.unit} onChange={(event) => updateDraft(index, "unit", event.target.value)} /></label><label>每箱／包數量<input inputMode="numeric" value={line.draft.pack_size} onChange={(event) => updateDraft(index, "pack_size", Math.max(1, Number(event.target.value.replace(/\D/g, ""))))} /></label></div></div> : <label>現有產品<select value={line.productId} onChange={(event) => updateLine(index, { productId: event.target.value })}>{items.map((entry) => <option key={entry.id} value={entry.id}>{entry.category}｜{entry.brand}｜{entry.flavor}</option>)}</select></label>}<div className="review-quantity"><label>數量<input inputMode="numeric" value={line.pieces} onChange={(event) => { const value = event.target.value.replace(/\D/g, ""); updateLine(index, { pieces: value === "" ? "" : Number(value) }); }} /></label><label>輸入單位<select value={line.unitMode} onChange={(event) => updateLine(index, { unitMode: event.target.value as UnitMode })}><option value="package">箱／包</option><option value="base">{item?.unit ?? "件"}</option></select></label><div><span>自動換算</span><strong>{converted} {item?.unit}</strong></div></div></div><button className="remove-button" onClick={() => removeLine(index)} aria-label="刪除項目">×</button></article>; })}
     </section>
     <footer className="review-footer"><div><span>確認後先建立新產品，再更新共享 Database</span><strong>{pdf.lines.length} 項 · {totalUnits} 件</strong></div><button className="primary-button" onClick={confirm} disabled={busy || !pdf.lines.length || invalid}>{busy ? "同步中…" : "確認全部入庫"}</button></footer>
   </div>;
