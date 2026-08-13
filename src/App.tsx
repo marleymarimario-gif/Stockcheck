@@ -21,6 +21,28 @@ type OcrProgress = { label: string; percent: number };
 
 const today = () => new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Hong_Kong" });
 const publisherId = import.meta.env.VITE_ADSENSE_PUBLISHER_ID ?? "";
+const appVersion = "2026.08.14.1";
+
+function useLatestAppVersion() {
+  useEffect(() => {
+    let active = true;
+    const check = async () => {
+      try {
+        const response = await fetch(`${import.meta.env.BASE_URL}version.json?t=${Date.now()}`, { cache: "no-store" });
+        const latest = await response.json() as { version?: string };
+        if (!active || !latest.version || latest.version === appVersion) return;
+        const url = new URL(location.href);
+        if (url.searchParams.get("appv") === latest.version) return;
+        url.searchParams.set("appv", latest.version);
+        location.replace(url.toString());
+      } catch { /* Offline use keeps the currently loaded version. */ }
+    };
+    check();
+    const onVisible = () => { if (document.visibilityState === "visible") check(); };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => { active = false; document.removeEventListener("visibilitychange", onVisible); };
+  }, []);
+}
 
 function useAdSense() {
   useEffect(() => {
@@ -40,6 +62,7 @@ export function App() {
   const [session, setSession] = useState<Session | null>(null);
   const [checking, setChecking] = useState(true);
   useAdSense();
+  useLatestAppVersion();
 
   useEffect(() => {
     supabase.auth.getSession().then(({ data }) => { setSession(data.session); setChecking(false); });
