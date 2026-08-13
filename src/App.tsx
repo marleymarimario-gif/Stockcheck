@@ -17,6 +17,7 @@ type NewProduct = {
   category: string; brand: string; flavor: string; name: string; spec: string;
   unit: string; packSize: string; initialPieces: string; lowStockLevel: string;
 };
+type OcrProgress = { label: string; percent: number };
 
 const today = () => new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Hong_Kong" });
 const publisherId = import.meta.env.VITE_ADSENSE_PUBLISHER_ID ?? "";
@@ -76,7 +77,7 @@ function PublicHome() {
       <div className="app-mark">倉</div><p className="eyebrow">手機共享庫存</p>
       <h1>倉點 <span>Stockcheck</span></h1>
       <p>每間店舖有獨立庫存，邀請同事後即可多人同步盤點；其他店舖無法查看你嘅資料。</p>
-      <div className="feature-grid"><span>✓ 每日 Stock Take</span><span>✓ 新產品及入貨</span><span>✓ PDF 本機辨認</span><span>✓ 操作記錄</span></div>
+      <div className="feature-grid"><span>✓ 每日 Stock Take</span><span>✓ 新產品及入貨</span><span>✓ PDF／圖片本機辨認</span><span>✓ 操作記錄</span></div>
       <label className="login-field">登入／開設帳戶<input type="email" inputMode="email" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="name@example.com" /></label>
       <button className="primary-button" onClick={signIn} disabled={busy}>{busy ? "寄出中…" : "寄出安全登入連結"}</button>
       {message && <p className="form-message">{message}</p>}
@@ -87,7 +88,61 @@ function PublicHome() {
 }
 
 function PrivacyDialog({ close }: { close: () => void }) {
-  return <div className="modal-backdrop"><section className="modal privacy-modal"><div className="modal-head"><div><p className="eyebrow">Privacy</p><h2>私隱政策</h2></div><button onClick={close}>關閉</button></div><p>倉點只儲存獲授權使用者的電郵、產品資料、盤點與入貨記錄。訂單 PDF 只在使用者裝置讀取，原檔不會上傳。</p><p>網站使用 Supabase 提供登入及共享資料庫，並可能使用 Google AdSense 顯示廣告。Google 可能按其政策使用 Cookie 或類似技術提供及量度廣告。</p><p>如要查閱或刪除帳戶資料，請聯絡網站管理員。使用本網站代表同意上述資料處理。</p></section></div>;
+  return <div className="modal-backdrop"><section className="modal privacy-modal"><div className="modal-head"><div><p className="eyebrow">Privacy</p><h2>私隱政策</h2></div><button onClick={close}>關閉</button></div><p>倉點只儲存獲授權使用者的電郵、產品資料、盤點與入貨記錄。PDF 及圖片會在使用者裝置內進行文字辨認，原檔不會上傳到 Stockcheck Database。</p><p>網站使用 Supabase 提供登入及共享資料庫，並可能使用 Google AdSense 顯示廣告。Google 可能按其政策使用 Cookie 或類似技術提供及量度廣告。</p><p>如要查閱或刪除帳戶資料，請聯絡網站管理員。使用本網站代表同意上述資料處理。</p></section></div>;
+}
+
+const normalizeOcr = (value: string) => value.normalize("NFKC").toLowerCase().replace(/[^\p{L}\p{N}]/gu, "");
+
+function recognitionAliases(item: InventoryItem) {
+  const aliases = [item.brand, item.flavor, item.name, item.spec];
+  const brand = item.brand.toLowerCase(); const flavor = item.flavor;
+  if (brand.includes("lay")) aliases.push(flavor.includes("洋蔥") ? "sour cream onion" : flavor.includes("原味") ? "classic potato chips" : "lay's");
+  if (brand.includes("pocky")) aliases.push("pocky", "固力果");
+  if (brand.includes("monster")) aliases.push(...(flavor.includes("無糖") ? ["超越無糖 白色", "超越", "白色", "無糖"] : ["碳酸能量飲料 黑色", "黑色"]));
+  if (brand.includes("edo pack")) aliases.push(...(flavor.includes("士多啤梨") ? ["士多啤利", "士多啤利朱古力", "士多啤利朱古力批", "草莓", "strawberry"] : ["edo pack 朱古力批"]));
+  if (brand.includes("coca-cola")) aliases.push(flavor.includes("無糖") ? "零系無糖可口可樂" : "可口可樂汽水");
+  if (brand.includes("lotte milkis")) aliases.push(flavor.includes("無糖") ? "milkis zero 零卡" : "原味忌廉溝鮮奶");
+  if (brand.includes("oreo")) aliases.push(flavor.includes("雲呢嗱") ? "雲呢嗱迷你朱古力夾心餅乾" : "朱古力味迷你朱古力夾心餅乾");
+  return [...new Set(aliases.map(normalizeOcr).filter((value) => value.length >= 2))];
+}
+
+function documentMatches(text: string, items: InventoryItem[]) {
+  const rawLines = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+  const candidates = rawLines.map((line, index) => {
+    const ownNumbers = [...line.matchAll(/(?:^|\s)(\d{1,3})(?=\s|$)/g)].map((match) => Number(match[1])).filter((value) => value > 0);
+    if (ownNumbers.length) return { text: line, quantity: ownNumbers.at(-1)! };
+    const next = rawLines[index + 1] ?? "";
+    const nextNumbers = [...next.matchAll(/^(\d{1,3})$/g)].map((match) => Number(match[1])).filter((value) => value > 0);
+    return nextNumbers.length ? { text: `${line} ${next}`, quantity: nextNumbers[0] } : null;
+  }).filter((value): value is { text: string; quantity: number } => Boolean(value));
+  const chosen = new Map<string, { score: number; lineIndex: number; quantity: number }>();
+  candidates.forEach((candidate, lineIndex) => {
+    const normalized = normalizeOcr(candidate.text); if (!normalized) return;
+    const ranked = items.map((item) => {
+      const aliases = recognitionAliases(item);
+      const weights = [5, aliases[1]?.length >= 3 ? 4 : 2, 10, 1];
+      const score = aliases.reduce((total, alias, index) => total + (normalized.includes(alias) ? (weights[index] ?? 7) : 0), 0);
+      return { item, score };
+    }).sort((a, b) => b.score - a.score);
+    const best = ranked[0]; const second = ranked[1];
+    if (!best || best.score < 6 || (second && best.score - second.score < 2 && best.score < 10)) return;
+    const current = chosen.get(best.item.id);
+    if (!current || best.score > current.score) chosen.set(best.item.id, { score: best.score, lineIndex, quantity: candidate.quantity });
+  });
+  const matches: PdfLine[] = [];
+  for (const [productId, value] of [...chosen.entries()].sort((a, b) => a[1].lineIndex - b[1].lineIndex)) {
+    matches.push({ productId, pieces: value.quantity, unitMode: "package" });
+  }
+  return matches;
+}
+
+async function recognizeImage(source: File | HTMLCanvasElement, update: (progress: OcrProgress) => void) {
+  const { createWorker, OEM } = await import("tesseract.js");
+  const worker = await createWorker(["eng", "chi_tra"], OEM.LSTM_ONLY, { logger: (message) => {
+    if (message.status === "recognizing text") update({ label: "辨認圖片文字", percent: Math.round(message.progress * 100) });
+  } });
+  try { const result = await worker.recognize(source); return result.data.text; }
+  finally { await worker.terminate(); }
 }
 
 function WorkspaceGate({ session }: { session: Session }) {
@@ -147,6 +202,7 @@ function Stockcheck({ session, workspace, workspaces, changeWorkspace, reloadWor
   const [showWorkspace, setShowWorkspace] = useState(false);
   const [pdf, setPdf] = useState<{ filename: string; orderNumber: string; lines: PdfLine[] } | null>(null);
   const [pdfBusy, setPdfBusy] = useState(false);
+  const [ocrProgress, setOcrProgress] = useState<OcrProgress | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
 
   const refresh = async () => {
@@ -195,23 +251,52 @@ function Stockcheck({ session, workspace, workspaces, changeWorkspace, reloadWor
     setStockIn((value) => ({ ...value, pieces: "1" })); setToast("入貨已同步到所有裝置"); await refresh();
   };
 
-  const handlePdf = async (file?: File) => {
-    if (!file) return; setPdfBusy(true);
+  const handleDocument = async (file?: File) => {
+    if (!file) return;
+    if (file.size > 20 * 1024 * 1024) return setToast("檔案不可大過 20MB");
+    const isPdf = file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf");
+    const isImage = file.type.startsWith("image/") || /\.(jpe?g|png)$/i.test(file.name);
+    if (!isPdf && !isImage) return setToast("請選擇 PDF、JPG、JPEG 或 PNG");
+    setPdfBusy(true); setOcrProgress({ label: "準備讀取檔案", percent: 0 });
     try {
-      const pdfjs = await import("pdfjs-dist/legacy/build/pdf.mjs");
-      pdfjs.GlobalWorkerOptions.workerSrc = new URL("pdfjs-dist/legacy/build/pdf.worker.min.mjs", import.meta.url).toString();
-      const document = await pdfjs.getDocument({ data: new Uint8Array(await file.arrayBuffer()) }).promise;
       let text = "";
-      for (let pageNo = 1; pageNo <= document.numPages; pageNo++) {
-        const content = await (await document.getPage(pageNo)).getTextContent();
-        text += " " + content.items.map((part) => "str" in part ? part.str : "").join(" ");
+      if (isImage) {
+        text = await recognizeImage(file, setOcrProgress);
+      } else {
+        const pdfjs = await import("pdfjs-dist/legacy/build/pdf.mjs");
+        pdfjs.GlobalWorkerOptions.workerSrc = new URL("pdfjs-dist/legacy/build/pdf.worker.min.mjs", import.meta.url).toString();
+        const pdfDocument = await pdfjs.getDocument({ data: new Uint8Array(await file.arrayBuffer()) }).promise;
+        let embeddedText = "";
+        for (let pageNo = 1; pageNo <= pdfDocument.numPages; pageNo++) {
+          setOcrProgress({ label: `讀取 PDF 第 ${pageNo}/${pdfDocument.numPages} 頁`, percent: Math.round(pageNo / pdfDocument.numPages * 20) });
+          const page = await pdfDocument.getPage(pageNo); const content = await page.getTextContent();
+          embeddedText += "\n" + content.items.map((part) => "str" in part ? part.str : "").join(" ");
+        }
+        const embeddedMatches = documentMatches(embeddedText, items);
+        if (embeddedMatches.length >= Math.min(3, items.length)) text = embeddedText;
+        else {
+          const { createWorker, OEM } = await import("tesseract.js");
+          const worker = await createWorker(["eng", "chi_tra"], OEM.LSTM_ONLY, { logger: (message) => {
+            if (message.status === "recognizing text") setOcrProgress((current) => ({ label: current?.label ?? "辨認 PDF", percent: Math.min(99, 20 + Math.round(message.progress * 80)) }));
+          } });
+          try {
+            for (let pageNo = 1; pageNo <= pdfDocument.numPages; pageNo++) {
+              setOcrProgress({ label: `OCR 辨認第 ${pageNo}/${pdfDocument.numPages} 頁`, percent: Math.round(20 + (pageNo - 1) / pdfDocument.numPages * 80) });
+              const page = await pdfDocument.getPage(pageNo); const viewport = page.getViewport({ scale: 2 });
+              const canvas = document.createElement("canvas"); canvas.width = Math.ceil(viewport.width); canvas.height = Math.ceil(viewport.height);
+              const context = canvas.getContext("2d", { alpha: false }); if (!context) throw new Error("Canvas unavailable");
+              await page.render({ canvas, canvasContext: context, viewport }).promise;
+              const result = await worker.recognize(canvas); text += "\n" + result.data.text;
+            }
+          } finally { await worker.terminate(); }
+        }
       }
-      const normalized = text.replace(/\s+/g, "").toLowerCase();
-      const matches = items.filter((item) => normalized.includes(item.brand.replace(/\s+/g, "").toLowerCase()) && normalized.includes(item.flavor.replace(/\s+/g, "").toLowerCase()));
-      setPdf({ filename: file.name, orderNumber: text.match(/H\d{12}/)?.[0] ?? "", lines: matches.map((item) => ({ productId: item.id, pieces: 1, unitMode: "package" })) });
-      setToast(matches.length ? `已辨認 ${matches.length} 款，請核對件數` : "未能自動配對，請改用手動入貨");
-    } catch { setToast("未能讀取呢份 PDF"); }
-    finally { setPdfBusy(false); if (fileRef.current) fileRef.current.value = ""; }
+      setOcrProgress({ label: "配對產品及數量", percent: 100 });
+      const matches = documentMatches(text, items);
+      setPdf({ filename: file.name, orderNumber: text.replace(/\s/g, "").match(/H\d{12}/i)?.[0]?.toUpperCase() ?? "", lines: matches });
+      setToast(matches.length ? `已辨認 ${matches.length} 款，請逐項核對` : "未能自動配對，請喺核對頁手動加入產品");
+    } catch (error) { console.error(error); setToast("未能讀取檔案，請確認圖片清晰或重試"); }
+    finally { setPdfBusy(false); setOcrProgress(null); if (fileRef.current) fileRef.current.value = ""; }
   };
 
   const confirmPdf = async () => {
@@ -219,11 +304,11 @@ function Stockcheck({ session, workspace, workspaces, changeWorkspace, reloadWor
     const rows = pdf.lines.filter((line) => line.pieces > 0).map((line) => {
       const item = items.find((entry) => entry.id === line.productId)!;
       const unitsAdded = line.unitMode === "package" ? line.pieces * item.pack_size : line.pieces;
-      return { workspace_id: workspace.id, product_id: item.id, pieces: line.unitMode === "package" ? line.pieces : 1, units_added: unitsAdded, entered_quantity: line.pieces, entered_unit: line.unitMode === "package" ? "箱／包" : item.unit, source: `PDF: ${pdf.filename}`, order_number: pdf.orderNumber || null, added_by: session.user.id, added_by_email: session.user.email };
+      return { workspace_id: workspace.id, product_id: item.id, pieces: line.unitMode === "package" ? line.pieces : 1, units_added: unitsAdded, entered_quantity: line.pieces, entered_unit: line.unitMode === "package" ? "箱／包" : item.unit, source: `上載檔案: ${pdf.filename}`, order_number: pdf.orderNumber || null, added_by: session.user.id, added_by_email: session.user.email };
     });
     const { error } = await supabase.from("stock_ins").insert(rows);
-    setBusy(null); if (error) return setToast(error.code === "23505" ? "呢張訂單已經入過貨" : "未能確認 PDF 入貨");
-    setPdf(null); setToast("PDF 入貨已同步到所有裝置"); await refresh();
+    setBusy(null); if (error) return setToast(error.code === "23505" ? "呢張訂單已經入過貨" : "未能確認檔案入貨");
+    setPdf(null); setToast("檔案入貨已同步到所有裝置"); await refresh();
   };
 
   return <main className="app-shell">
@@ -236,7 +321,7 @@ function Stockcheck({ session, workspace, workspaces, changeWorkspace, reloadWor
 
     {tab === "stock" && <section className="content-section"><div className="section-heading"><div><p className="eyebrow">即時共享</p><h2>庫存清單</h2></div><span>{filtered.length} 款</span></div><div className="stock-list">{groups.map(([category, products]) => <section key={category}><h3>{category}</h3>{products.map((item) => <div className="stock-row" key={item.id}><div><strong>{item.brand} · {item.flavor}</strong><span>{item.name}｜{item.spec}</span></div><div className={item.current_qty <= item.low_stock_level ? "qty low" : "qty"}><strong>{item.current_qty}</strong><small>{item.unit}</small></div></div>)}</section>)}</div></section>}
 
-    {tab === "inbound" && <section className="content-section"><div className="section-heading"><div><p className="eyebrow">增加庫存</p><h2>新貨入庫</h2></div><button className="outline-button" onClick={() => setShowNewProduct(true)}>＋ 新增產品</button></div><div className="form-card"><label>現有產品<select value={stockIn.productId} onChange={(event) => setStockIn({ ...stockIn, productId: event.target.value })}><option value="">請選擇</option>{items.map((item) => <option value={item.id} key={item.id}>{item.category}｜{item.brand}｜{item.flavor}</option>)}</select></label><div className="quantity-unit-row"><label>新增數量<input inputMode="numeric" value={stockIn.pieces} onChange={(event) => setStockIn({ ...stockIn, pieces: event.target.value.replace(/\D/g, "") })} /></label><label>輸入單位<select value={stockIn.unitMode} onChange={(event) => setStockIn({ ...stockIn, unitMode: event.target.value as UnitMode })}><option value="package">箱／包</option><option value="base">{items.find((item) => item.id === stockIn.productId)?.unit ?? "件"}</option></select></label></div>{stockIn.productId && <div className="conversion-note">自動換算：<strong>{stockIn.unitMode === "package" ? Number(stockIn.pieces || 0) * (items.find((item) => item.id === stockIn.productId)?.pack_size ?? 0) : Number(stockIn.pieces || 0)}</strong> {items.find((item) => item.id === stockIn.productId)?.unit}</div>}<label>來源<input value={stockIn.source} onChange={(event) => setStockIn({ ...stockIn, source: event.target.value })} /></label><button className="primary-button" onClick={saveInbound} disabled={busy === "inbound"}>{busy === "inbound" ? "儲存中…" : "確認入貨"}</button></div><div className="pdf-card"><div className="pdf-icon">PDF</div><div><strong>從訂單 PDF 辨認</strong><p>完成後會先進入資料核對頁，未確認唔會改庫存。</p></div><button onClick={() => fileRef.current?.click()} disabled={pdfBusy}>{pdfBusy ? "讀取中" : "選擇 PDF"}</button><input ref={fileRef} hidden type="file" accept="application/pdf" onChange={(event) => handlePdf(event.target.files?.[0])} /></div></section>}
+    {tab === "inbound" && <section className="content-section"><div className="section-heading"><div><p className="eyebrow">增加庫存</p><h2>新貨入庫</h2></div><button className="outline-button" onClick={() => setShowNewProduct(true)}>＋ 新增產品</button></div><div className="form-card"><label>現有產品<select value={stockIn.productId} onChange={(event) => setStockIn({ ...stockIn, productId: event.target.value })}><option value="">請選擇</option>{items.map((item) => <option value={item.id} key={item.id}>{item.category}｜{item.brand}｜{item.flavor}</option>)}</select></label><div className="quantity-unit-row"><label>新增數量<input inputMode="numeric" value={stockIn.pieces} onChange={(event) => setStockIn({ ...stockIn, pieces: event.target.value.replace(/\D/g, "") })} /></label><label>輸入單位<select value={stockIn.unitMode} onChange={(event) => setStockIn({ ...stockIn, unitMode: event.target.value as UnitMode })}><option value="package">箱／包</option><option value="base">{items.find((item) => item.id === stockIn.productId)?.unit ?? "件"}</option></select></label></div>{stockIn.productId && <div className="conversion-note">自動換算：<strong>{stockIn.unitMode === "package" ? Number(stockIn.pieces || 0) * (items.find((item) => item.id === stockIn.productId)?.pack_size ?? 0) : Number(stockIn.pieces || 0)}</strong> {items.find((item) => item.id === stockIn.productId)?.unit}</div>}<label>來源<input value={stockIn.source} onChange={(event) => setStockIn({ ...stockIn, source: event.target.value })} /></label><button className="primary-button" onClick={saveInbound} disabled={busy === "inbound"}>{busy === "inbound" ? "儲存中…" : "確認入貨"}</button></div><div className="pdf-card"><div className="pdf-icon">OCR</div><div><strong>從 PDF 或相片辨認</strong><p>支援 PDF、JPG、JPEG、PNG；完成後必須先核對，未確認唔會改庫存。</p></div><button onClick={() => fileRef.current?.click()} disabled={pdfBusy}>{pdfBusy ? `${ocrProgress?.percent ?? 0}%` : "選擇檔案"}</button><input ref={fileRef} hidden type="file" accept="application/pdf,image/jpeg,image/png,.jpg,.jpeg,.png" onChange={(event) => handleDocument(event.target.files?.[0])} /></div>{ocrProgress && <div className="ocr-progress"><div><span>{ocrProgress.label}</span><b>{ocrProgress.percent}%</b></div><i><em style={{ width: `${ocrProgress.percent}%` }} /></i><small>首次使用會下載中文及英文辨認模型，請保持網絡連線。</small></div>}</section>}
 
     {tab === "activity" && <section className="content-section"><div className="section-heading"><div><p className="eyebrow">可追查記錄</p><h2>最近操作</h2></div></div><div className="activity-list">{activity.length ? activity.map((entry, index) => <div className="activity-row" key={`${entry.happened_at}-${index}`}><span className={entry.kind === "盤點" ? "activity-icon count" : "activity-icon inbound"}>{entry.kind === "盤點" ? "✓" : "+"}</span><div><strong>{entry.product_name}</strong><p>{entry.actor} · {new Date(entry.happened_at).toLocaleString("zh-HK")}</p></div><b>{entry.kind === "盤點" ? entry.quantity : `+${entry.quantity}`}</b></div>) : <div className="empty">未有操作記錄</div>}</div></section>}
 
@@ -319,7 +404,7 @@ function UploadReview({ pdf, items, setPdf, confirm, busy }: { pdf: { filename: 
   const addLine = () => { if (!items[0]) return; setPdf({ ...pdf, lines: [...pdf.lines, { productId: items[0].id, pieces: 1, unitMode: "package" }] }); };
   return <div className="review-page">
     <header className="review-topbar"><button onClick={() => setPdf(null)}>← 取消</button><div><p className="eyebrow">未更新庫存</p><h2>資料核對</h2></div><span>{pdf.lines.length} 項</span></header>
-    <section className="review-summary"><div><span>PDF 檔案</span><strong>{pdf.filename}</strong></div><label>訂單編號<input value={pdf.orderNumber} onChange={(event) => setPdf({ ...pdf, orderNumber: event.target.value })} placeholder="如有訂單編號請填寫" /></label><div className="review-totals"><span>辨認項目 <b>{pdf.lines.length}</b></span><span>預計新增 <b>{totalUnits}</b> 件</span></div></section>
+    <section className="review-summary"><div><span>上載檔案</span><strong>{pdf.filename}</strong></div><label>訂單編號<input value={pdf.orderNumber} onChange={(event) => setPdf({ ...pdf, orderNumber: event.target.value })} placeholder="如有訂單編號請填寫" /></label><div className="review-totals"><span>辨認項目 <b>{pdf.lines.length}</b></span><span>預計新增 <b>{totalUnits}</b> 件</span></div></section>
     <section className="review-list"><div className="review-heading"><div><p className="eyebrow">逐項確認</p><h3>產品及數量</h3></div><button className="outline-button" onClick={addLine}>＋ 加漏咗嘅貨</button></div>
       {!pdf.lines.length && <div className="empty-card"><strong>未辨認到產品</strong><p>按「加漏咗嘅貨」手動加入，再確認入庫。</p></div>}
       {pdf.lines.map((line, index) => { const item = items.find((entry) => entry.id === line.productId); const converted = line.unitMode === "package" ? line.pieces * (item?.pack_size ?? 0) : line.pieces; return <article className="review-item" key={`${index}-${line.productId}`}><div className="review-item-number">{index + 1}</div><div className="review-fields"><label>產品<select value={line.productId} onChange={(event) => updateLine(index, { productId: event.target.value })}>{items.map((entry) => <option key={entry.id} value={entry.id}>{entry.category}｜{entry.brand}｜{entry.flavor}</option>)}</select></label><div className="review-quantity"><label>數量<input inputMode="numeric" value={line.pieces} onChange={(event) => updateLine(index, { pieces: Math.max(0, Number(event.target.value.replace(/\D/g, ""))) })} /></label><label>輸入單位<select value={line.unitMode} onChange={(event) => updateLine(index, { unitMode: event.target.value as UnitMode })}><option value="package">箱／包</option><option value="base">{item?.unit ?? "件"}</option></select></label><div><span>自動換算</span><strong>{converted} {item?.unit}</strong></div></div></div><button className="remove-button" onClick={() => removeLine(index)} aria-label="刪除項目">×</button></article>; })}
