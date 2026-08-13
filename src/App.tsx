@@ -27,7 +27,7 @@ type OcrProgress = { label: string; percent: number };
 
 const today = () => new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Hong_Kong" });
 const publisherId = import.meta.env.VITE_ADSENSE_PUBLISHER_ID ?? "";
-const appVersion = "2026.08.14.3";
+const appVersion = "2026.08.14.4";
 
 function useLatestAppVersion() {
   useEffect(() => {
@@ -335,13 +335,23 @@ function Stockcheck({ session, workspace, workspaces, changeWorkspace, reloadWor
         failureStage = "PDF-OPEN";
         const pdfDocument = await pdfjs.getDocument({ data: new Uint8Array(await file.arrayBuffer()) }).promise;
         let embeddedText = "";
+        let embeddedTextAvailable = true;
         for (let pageNo = 1; pageNo <= pdfDocument.numPages; pageNo++) {
-          failureStage = `PDF-TEXT-${pageNo}`;
           setOcrProgress({ label: `讀取 PDF 第 ${pageNo}/${pdfDocument.numPages} 頁`, percent: Math.round(pageNo / pdfDocument.numPages * 20) });
-          const page = await pdfDocument.getPage(pageNo); const content = await page.getTextContent();
-          embeddedText += "\n" + content.items.map((part) => "str" in part ? part.str : "").join(" ");
+          failureStage = `PDF-PAGE-${pageNo}`;
+          const page = await pdfDocument.getPage(pageNo);
+          failureStage = `PDF-TEXT-${pageNo}`;
+          try {
+            const content = await page.getTextContent();
+            embeddedText += "\n" + content.items.map((part) => "str" in part ? part.str : "").join(" ");
+          } catch (textError) {
+            console.warn("PDF text layer unavailable; continuing with page OCR", { pageNo, textError });
+            embeddedTextAvailable = false;
+            embeddedText = "";
+            break;
+          }
         }
-        const embeddedMatches = documentMatches(embeddedText, candidates);
+        const embeddedMatches = embeddedTextAvailable ? documentMatches(embeddedText, candidates) : [];
         if (embeddedMatches.length >= 20) text = embeddedText;
         else {
           failureStage = "OCR-START";
