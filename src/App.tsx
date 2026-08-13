@@ -8,7 +8,12 @@ type InventoryItem = {
   spec: string; unit: string; pack_size: number; current_qty: number;
   low_stock_level: number; stocktake_date: string | null; counted_by_email: string | null;
 };
-type Activity = { kind: string; product_name: string; quantity: number; actor: string; happened_at: string };
+type Activity = {
+  id: number; kind: string; product_id: string; product_name: string; quantity: number;
+  entered_quantity: number; entered_unit: string; pack_size: number; actor_id: string;
+  actor: string; happened_at: string; is_corrected: boolean; original_quantity: number | null;
+  original_product_name: string | null; corrected_by_email: string | null; corrected_at: string | null;
+};
 type Workspace = { id: string; name: string; role: "owner" | "admin" | "member" };
 type WorkspaceMember = { user_id: string; email: string; role: string };
 type Tab = "count" | "stock" | "inbound" | "activity";
@@ -27,7 +32,7 @@ type OcrProgress = { label: string; percent: number };
 
 const today = () => new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Hong_Kong" });
 const publisherId = import.meta.env.VITE_ADSENSE_PUBLISHER_ID ?? "";
-const appVersion = "2026.08.14.7";
+const appVersion = "2026.08.14.8";
 
 function useLatestAppVersion() {
   useEffect(() => {
@@ -404,6 +409,8 @@ function Stockcheck({ session, workspace, workspaces, changeWorkspace, reloadWor
   const [toast, setToast] = useState("");
   const [stockIn, setStockIn] = useState<{ productId: string; pieces: string; source: string; unitMode: UnitMode }>({ productId: "", pieces: "1", source: "手動入貨", unitMode: "package" });
   const [showNewProduct, setShowNewProduct] = useState(false);
+  const [editingProduct, setEditingProduct] = useState<InventoryItem | null>(null);
+  const [correctingEntry, setCorrectingEntry] = useState<Activity | null>(null);
   const [showWorkspace, setShowWorkspace] = useState(false);
   const [pdf, setPdf] = useState<{ filename: string; orderNumber: string; lines: PdfLine[] } | null>(null);
   const [pdfBusy, setPdfBusy] = useState(false);
@@ -570,15 +577,17 @@ function Stockcheck({ session, workspace, workspaces, changeWorkspace, reloadWor
 
     {tab === "count" && <section className="content-section"><div className="section-heading"><div><p className="eyebrow">按種類排列</p><h2>每日盤點</h2></div><span>{items.length - doneToday} 款未完成</span></div>{!items.length && <EmptyProducts open={() => setTab("inbound")} />}<div className="category-list">{groups.map(([category, products]) => { const complete = products.filter((item) => item.stocktake_date === today()).length; const open = expanded === category || Boolean(query); return <article className="category" key={category}><button className="category-head" onClick={() => setExpanded(open && !query ? null : category)}><span className="category-icon">{category.slice(0, 1)}</span><span><strong>{category}</strong><small>{products.length} 款產品</small></span><span className={complete === products.length ? "done-pill" : "count-pill"}>{complete}/{products.length}</span><b>{open ? "−" : "+"}</b></button>{open && <div className="product-list">{products.map((item) => <ProductCountCard key={item.id} item={item} value={counts[item.id] ?? ""} unitMode={countUnits[item.id] ?? "base"} onUnitChange={(unitMode) => setCountUnits((all) => ({ ...all, [item.id]: unitMode }))} onChange={(value) => setCounts((all) => ({ ...all, [item.id]: value }))} onSave={() => saveCount(item)} busy={busy === item.id} />)}</div>}</article>; })}</div></section>}
 
-    {tab === "stock" && <section className="content-section"><div className="section-heading"><div><p className="eyebrow">即時共享</p><h2>庫存清單</h2></div><span>{filtered.length} 款</span></div><div className="stock-list">{groups.map(([category, products]) => <section key={category}><h3>{category}</h3>{products.map((item) => <div className="stock-row" key={item.id}><div><strong>{item.brand} · {item.flavor}</strong><span>{item.name}｜{item.spec}</span></div><div className={item.current_qty <= item.low_stock_level ? "qty low" : "qty"}><strong>{item.current_qty}</strong><small>{item.unit}</small></div></div>)}</section>)}</div></section>}
+    {tab === "stock" && <section className="content-section"><div className="section-heading"><div><p className="eyebrow">即時共享</p><h2>庫存清單</h2></div><span>{filtered.length} 款</span></div><div className="stock-list">{groups.map(([category, products]) => <section key={category}><h3>{category}</h3>{products.map((item) => <button className="stock-row stock-edit-row" key={item.id} onClick={() => setEditingProduct(item)}><div><strong>{item.brand} · {item.flavor}</strong><span>{item.name}｜{item.spec}</span></div><div className={item.current_qty <= item.low_stock_level ? "qty low" : "qty"}><strong>{item.current_qty}</strong><small>{item.unit} · 編輯 ›</small></div></button>)}</section>)}</div></section>}
 
     {tab === "inbound" && <section className="content-section"><div className="section-heading"><div><p className="eyebrow">增加庫存</p><h2>新貨入庫</h2></div><button className="outline-button" onClick={() => setShowNewProduct(true)}>＋ 新增產品</button></div><div className="form-card"><label>現有產品<select value={stockIn.productId} onChange={(event) => setStockIn({ ...stockIn, productId: event.target.value })}><option value="">請選擇</option>{items.map((item) => <option value={item.id} key={item.id}>{item.category}｜{item.brand}｜{item.flavor}</option>)}</select></label><div className="quantity-unit-row"><label>新增數量<input inputMode="numeric" value={stockIn.pieces} onChange={(event) => setStockIn({ ...stockIn, pieces: event.target.value.replace(/\D/g, "") })} /></label><label>輸入單位<select value={stockIn.unitMode} onChange={(event) => setStockIn({ ...stockIn, unitMode: event.target.value as UnitMode })}><option value="package">箱／包</option><option value="base">{items.find((item) => item.id === stockIn.productId)?.unit ?? "件"}</option></select></label></div>{stockIn.productId && <div className="conversion-note">自動換算：<strong>{stockIn.unitMode === "package" ? Number(stockIn.pieces || 0) * (items.find((item) => item.id === stockIn.productId)?.pack_size ?? 0) : Number(stockIn.pieces || 0)}</strong> {items.find((item) => item.id === stockIn.productId)?.unit}</div>}<label>來源<input value={stockIn.source} onChange={(event) => setStockIn({ ...stockIn, source: event.target.value })} /></label><button className="primary-button" onClick={saveInbound} disabled={busy === "inbound"}>{busy === "inbound" ? "儲存中…" : "確認入貨"}</button></div><div className="pdf-card"><div className="pdf-icon">OCR</div><div><strong>從 PDF 或相片辨認</strong><p>支援 PDF、JPG、JPEG、PNG；完成後必須先核對，未確認唔會改庫存。</p></div><button onClick={() => fileRef.current?.click()} disabled={pdfBusy}>{pdfBusy ? `${ocrProgress?.percent ?? 0}%` : "選擇檔案"}</button><input ref={fileRef} hidden type="file" accept="application/pdf,image/jpeg,image/png,.jpg,.jpeg,.png" onChange={(event) => handleDocument(event.target.files?.[0])} /></div>{ocrProgress && <div className="ocr-progress"><div><span>{ocrProgress.label}</span><b>{ocrProgress.percent}%</b></div><i><em style={{ width: `${ocrProgress.percent}%` }} /></i><small>首次使用會下載中文及英文辨認模型，請保持網絡連線。</small></div>}</section>}
 
-    {tab === "activity" && <section className="content-section"><div className="section-heading"><div><p className="eyebrow">可追查記錄</p><h2>最近操作</h2></div></div><div className="activity-list">{activity.length ? activity.map((entry, index) => <div className="activity-row" key={`${entry.happened_at}-${index}`}><span className={entry.kind === "盤點" ? "activity-icon count" : "activity-icon inbound"}>{entry.kind === "盤點" ? "✓" : "+"}</span><div><strong>{entry.product_name}</strong><p>{entry.actor} · {new Date(entry.happened_at).toLocaleString("zh-HK")}</p></div><b>{entry.kind === "盤點" ? entry.quantity : `+${entry.quantity}`}</b></div>) : <div className="empty">未有操作記錄</div>}</div></section>}
+    {tab === "activity" && <section className="content-section"><div className="section-heading"><div><p className="eyebrow">可追查記錄</p><h2>最近操作</h2></div></div><div className="activity-list">{activity.length ? activity.map((entry) => { const canCorrect = entry.kind === "入貨" && (workspace.role !== "member" || entry.actor_id === session.user.id); return <div className={entry.is_corrected ? "activity-row corrected" : "activity-row"} key={`${entry.kind}-${entry.id}`}><span className={entry.kind === "盤點" ? "activity-icon count" : "activity-icon inbound"}>{entry.kind === "盤點" ? "✓" : "+"}</span><div><strong>{entry.product_name}{entry.is_corrected && <em>已更正</em>}</strong><p>{entry.actor} · {new Date(entry.happened_at).toLocaleString("zh-HK")}</p>{entry.is_corrected && <small>原本：{entry.original_product_name} +{entry.original_quantity}；由 {entry.corrected_by_email} 更正</small>}</div><aside><b>{entry.kind === "盤點" ? entry.quantity : `+${entry.quantity}`}</b>{canCorrect && <button onClick={() => setCorrectingEntry(entry)}>更正</button>}</aside></div>; }) : <div className="empty">未有操作記錄</div>}</div></section>}
 
     <div className="ad-safe-gap" aria-label="Google 廣告安全區" />
     <nav className="bottom-nav">{([["count","盤點","✓"],["stock","庫存","▦"],["inbound","入貨","＋"],["activity","記錄","◷"]] as [Tab,string,string][]).map(([id,label,icon]) => <button key={id} className={tab === id ? "active" : ""} onClick={() => setTab(id)}><span>{icon}</span>{label}</button>)}</nav>
     {showNewProduct && <NewProductDialog session={session} workspaceId={workspace.id} close={() => setShowNewProduct(false)} saved={async () => { setShowNewProduct(false); setToast("新產品已加入共享清單"); await refresh(); }} />}
+    {editingProduct && <EditProductDialog item={editingProduct} categories={[...new Set(items.map((item) => item.category))].sort()} close={() => setEditingProduct(null)} saved={async () => { setEditingProduct(null); setToast("產品資料已同步到所有裝置"); await refresh(); }} />}
+    {correctingEntry && <CorrectStockInDialog entry={correctingEntry} items={items} workspace={workspace} close={() => setCorrectingEntry(null)} saved={async () => { setCorrectingEntry(null); setToast("入貨記錄及庫存已更正"); await refresh(); }} />}
     {showWorkspace && <WorkspaceDialog session={session} workspace={workspace} workspaces={workspaces} changeWorkspace={changeWorkspace} reload={reloadWorkspaces} close={() => setShowWorkspace(false)} />}
     {pdf && <UploadReview pdf={pdf} items={items} setPdf={setPdf} confirm={confirmPdf} busy={busy === "pdf"} />}
     {toast && <div className="toast">{toast}</div>}
@@ -586,6 +595,34 @@ function Stockcheck({ session, workspace, workspaces, changeWorkspace, reloadWor
 }
 
 function EmptyProducts({ open }: { open: () => void }) { return <div className="empty-card"><strong>未有產品</strong><p>可以上載第一張訂單自動建立產品，或者手動新增。</p><button className="primary-button" onClick={open}>前往入貨</button></div>; }
+
+function EditProductDialog({ item, categories, close, saved }: { item: InventoryItem; categories: string[]; close: () => void; saved: () => Promise<void> }) {
+  const [form, setForm] = useState({ category: item.category, brand: item.brand, flavor: item.flavor, name: item.name, spec: item.spec, unit: item.unit, packSize: String(item.pack_size), lowStockLevel: String(item.low_stock_level) });
+  const [busy, setBusy] = useState(false); const [error, setError] = useState("");
+  const change = (key: keyof typeof form, value: string) => setForm((current) => ({ ...current, [key]: value }));
+  const save = async () => {
+    const packSize = Number(form.packSize); const low = Number(form.lowStockLevel);
+    if (![form.category, form.brand, form.flavor, form.name, form.unit].every((value) => value.trim()) || !Number.isInteger(packSize) || packSize < 1 || !Number.isInteger(low) || low < 0) return setError("請填妥產品資料及正確數量");
+    setBusy(true);
+    const { error: updateError } = await supabase.from("products").update({ category: form.category.trim(), brand: form.brand.trim(), flavor: form.flavor.trim(), name: form.name.trim(), spec: form.spec.trim(), unit: form.unit.trim(), pack_size: packSize, low_stock_level: low }).eq("id", item.id);
+    setBusy(false); if (updateError) return setError("未能更新產品資料"); await saved();
+  };
+  return <div className="modal-backdrop"><section className="modal"><div className="modal-head"><div><p className="eyebrow">產品目錄</p><h2>編輯產品</h2></div><button onClick={close}>取消</button></div><div className="modal-form"><label>種類<input list="product-categories" value={form.category} onChange={(event) => change("category", event.target.value)} placeholder="揀現有分類或輸入新分類" /><datalist id="product-categories">{categories.map((category) => <option value={category} key={category} />)}</datalist><small className="field-help">可從現有分類選擇，亦可直接輸入新分類。</small></label><div className="two-fields"><label>品牌<input value={form.brand} onChange={(event) => change("brand", event.target.value)} /></label><label>味道<input value={form.flavor} onChange={(event) => change("flavor", event.target.value)} /></label></div><label>產品名稱<input value={form.name} onChange={(event) => change("name", event.target.value)} /></label><div className="two-fields"><label>規格<input value={form.spec} onChange={(event) => change("spec", event.target.value)} /></label><label>基本單位<input value={form.unit} onChange={(event) => change("unit", event.target.value)} /></label></div><div className="two-fields"><label>每箱／包件數<input inputMode="numeric" value={form.packSize} onChange={(event) => change("packSize", event.target.value.replace(/\D/g, ""))} /></label><label>低存量提示<input inputMode="numeric" value={form.lowStockLevel} onChange={(event) => change("lowStockLevel", event.target.value.replace(/\D/g, ""))} /></label></div><div className="status-note">改名或分類唔會刪除舊記錄；所有裝置會顯示更新後資料。</div>{error && <p className="form-message error">{error}</p>}<button className="primary-button" onClick={save} disabled={busy}>{busy ? "同步中…" : "儲存產品資料"}</button></div></section></div>;
+}
+
+function CorrectStockInDialog({ entry, items, workspace, close, saved }: { entry: Activity; items: InventoryItem[]; workspace: Workspace; close: () => void; saved: () => Promise<void> }) {
+  const [form, setForm] = useState({ productId: entry.product_id, quantity: String(entry.entered_quantity), unitMode: (entry.entered_unit === "箱／包" ? "package" : "base") as UnitMode });
+  const [busy, setBusy] = useState(false); const [error, setError] = useState("");
+  const item = items.find((product) => product.id === form.productId);
+  const enteredQuantity = Number(form.quantity); const units = form.unitMode === "package" ? enteredQuantity * (item?.pack_size ?? 0) : enteredQuantity;
+  const save = async () => {
+    if (!item || !Number.isInteger(enteredQuantity) || enteredQuantity <= 0) return setError("請選擇產品及輸入正確數量");
+    setBusy(true);
+    const { error: updateError } = await supabase.rpc("correct_stock_in", { target_workspace: workspace.id, target_stock_in: entry.id, target_product: item.id, target_quantity: enteredQuantity, target_unit_mode: form.unitMode });
+    setBusy(false); if (updateError) return setError("未能更正入貨；請確認你有操作權限"); await saved();
+  };
+  return <div className="modal-backdrop"><section className="modal correction-modal"><div className="modal-head"><div><p className="eyebrow">保留原記錄</p><h2>更正入貨</h2></div><button onClick={close}>取消</button></div><div className="original-entry"><span>原本記錄</span><strong>{entry.original_product_name ?? entry.product_name} · +{entry.original_quantity ?? entry.quantity}</strong><small>{entry.actor} · {new Date(entry.happened_at).toLocaleString("zh-HK")}</small></div><div className="modal-form"><label>正確產品<select value={form.productId} onChange={(event) => setForm({ ...form, productId: event.target.value })}>{items.map((product) => <option key={product.id} value={product.id}>{product.category}｜{product.brand}｜{product.flavor}</option>)}</select></label><div className="quantity-unit-row"><label>正確數量<input inputMode="numeric" value={form.quantity} onChange={(event) => setForm({ ...form, quantity: event.target.value.replace(/\D/g, "") })} /></label><label>輸入單位<select value={form.unitMode} onChange={(event) => setForm({ ...form, unitMode: event.target.value as UnitMode })}><option value="package">箱／包</option><option value="base">{item?.unit ?? "件"}</option></select></label></div><div className="conversion-note">更正後入貨：<strong>{Number.isFinite(units) ? units : 0}</strong> {item?.unit}</div><div className="status-note">系統會保留原資料及更正人，庫存按正確數量自動重算。</div>{error && <p className="form-message error">{error}</p>}<button className="primary-button" onClick={save} disabled={busy || !form.quantity}>{busy ? "更正中…" : "確認更正"}</button></div></section></div>;
+}
 
 function ProductCountCard({ item, value, unitMode, onUnitChange, onChange, onSave, busy }: { item: InventoryItem; value: string; unitMode: UnitMode; onUnitChange: (v: UnitMode) => void; onChange: (v: string) => void; onSave: () => void; busy: boolean }) {
   const done = item.stocktake_date === today();
