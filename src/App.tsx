@@ -27,7 +27,7 @@ type OcrProgress = { label: string; percent: number };
 
 const today = () => new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Hong_Kong" });
 const publisherId = import.meta.env.VITE_ADSENSE_PUBLISHER_ID ?? "";
-const appVersion = "2026.08.14.4";
+const appVersion = "2026.08.14.5";
 
 function useLatestAppVersion() {
   useEffect(() => {
@@ -166,16 +166,19 @@ function recognitionAliases(item: RecognizableProduct) {
 }
 
 function documentMatches(text: string, items: RecognizableProduct[]) {
-  const rawLines = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
-  const candidates = rawLines.map((line, index) => {
+  const rawLines = text.split(/\r?\n/).map((line) => line.normalize("NFKC").trim()).filter(Boolean);
+  const candidates: { text: string; quantity: number; lineIndex: number }[] = [];
+  rawLines.forEach((line, index) => {
     const ownNumbers = [...line.matchAll(/(?:^|\s)(\d{1,3})(?=\s|$)/g)].map((match) => Number(match[1])).filter((value) => value > 0);
-    if (ownNumbers.length) return { text: line, quantity: ownNumbers.at(-1)! };
-    const next = rawLines[index + 1] ?? "";
-    const nextNumbers = [...next.matchAll(/^(\d{1,3})$/g)].map((match) => Number(match[1])).filter((value) => value > 0);
-    return nextNumbers.length ? { text: `${line} ${next}`, quantity: nextNumbers[0] } : null;
-  }).filter((value): value is { text: string; quantity: number } => Boolean(value));
+    if (ownNumbers.length) candidates.push({ text: line, quantity: ownNumbers.at(-1)!, lineIndex: index });
+    for (let span = 2; span <= 4 && index + span <= rawLines.length; span++) {
+      const window = rawLines.slice(index, index + span).join(" ");
+      const trailing = window.match(/(?:^|\s)(\d{1,3})\s*$/);
+      if (trailing) candidates.push({ text: window, quantity: Number(trailing[1]), lineIndex: index });
+    }
+  });
   const chosen = new Map<string, { score: number; lineIndex: number; quantity: number }>();
-  candidates.forEach((candidate, lineIndex) => {
+  candidates.forEach((candidate) => {
     const normalized = normalizeOcr(candidate.text); if (!normalized) return;
     const ranked = items.map((item) => {
       const aliases = recognitionAliases(item);
@@ -186,7 +189,7 @@ function documentMatches(text: string, items: RecognizableProduct[]) {
     const best = ranked[0]; const second = ranked[1];
     if (!best || best.score < 6 || (second && best.score - second.score < 2 && best.score < 10)) return;
     const current = chosen.get(best.item.id);
-    if (!current || best.score > current.score) chosen.set(best.item.id, { score: best.score, lineIndex, quantity: candidate.quantity });
+    if (!current || best.score > current.score) chosen.set(best.item.id, { score: best.score, lineIndex: candidate.lineIndex, quantity: candidate.quantity });
   });
   const matches: PdfLine[] = [];
   for (const [productId, value] of [...chosen.entries()].sort((a, b) => a[1].lineIndex - b[1].lineIndex)) {
@@ -195,8 +198,56 @@ function documentMatches(text: string, items: RecognizableProduct[]) {
   return matches;
 }
 
-async function recognizeImage(source: File | HTMLCanvasElement, update: (progress: OcrProgress) => void) {
-  const { createWorker, OEM } = await import("tesseract.js");
+function documentProductMatches(text: string, items: RecognizableProduct[]) {
+  const rawLines = text.split(/\r?\n/).map((line) => line.normalize("NFKC").trim()).filter(Boolean);
+  const chosen = new Map<string, { score: number; lineIndex: number }>();
+  rawLines.forEach((_line, lineIndex) => {
+    for (let span = 1; span <= 3 && lineIndex + span <= rawLines.length; span++) {
+      const normalized = normalizeOcr(rawLines.slice(lineIndex, lineIndex + span).join(" ")); if (!normalized) continue;
+      const ranked = items.map((item) => {
+        const aliases = recognitionAliases(item);
+        const weights = [5, aliases[1]?.length >= 3 ? 4 : 2, 10, 1];
+        const score = aliases.reduce((total, alias, index) => total + (normalized.includes(alias) ? (weights[index] ?? 7) : 0), 0);
+        return { item, score };
+      }).sort((a, b) => b.score - a.score);
+      const best = ranked[0]; const second = ranked[1];
+      if (!best || best.score < 6 || (second && best.score - second.score < 2 && best.score < 10)) continue;
+      const current = chosen.get(best.item.id);
+      if (!current || best.score > current.score) chosen.set(best.item.id, { score: best.score, lineIndex });
+    }
+  });
+  return [...chosen.entries()].sort((a, b) => a[1].lineIndex - b[1].lineIndex).map(([productId]) => productId);
+}
+
+async function imageQuantityColumn(source: File) {
+  const url = URL.createObjectURL(source);
+  try {
+    const image = await new Promise<HTMLImageElement>((resolve, reject) => {
+      const element = new Image(); element.onload = () => resolve(element); element.onerror = reject; element.src = url;
+    });
+    const sourceX = Math.floor(image.naturalWidth * .78); const sourceY = Math.floor(image.naturalHeight * .08);
+    const sourceWidth = image.naturalWidth - sourceX; const sourceHeight = Math.floor(image.naturalHeight * .84);
+    const scale = 3; const canvas = document.createElement("canvas");
+    canvas.width = sourceWidth * scale; canvas.height = sourceHeight * scale;
+    const context = canvas.getContext("2d", { alpha: false, willReadFrequently: true }); if (!context) throw new Error("Canvas unavailable");
+    context.drawImage(image, sourceX, sourceY, sourceWidth, sourceHeight, 0, 0, canvas.width, canvas.height);
+    const pixels = context.getImageData(0, 0, canvas.width, canvas.height); let min = 255; let max = 0;
+    for (let index = 0; index < pixels.data.length; index += 4) {
+      const gray = Math.round(pixels.data[index] * .299 + pixels.data[index + 1] * .587 + pixels.data[index + 2] * .114);
+      pixels.data[index] = gray; min = Math.min(min, gray); max = Math.max(max, gray);
+    }
+    const range = Math.max(1, max - min);
+    for (let index = 0; index < pixels.data.length; index += 4) {
+      const stretched = (pixels.data[index] - min) * 255 / range;
+      const value = Math.max(0, Math.min(255, (stretched - 128) * 2.5 + 128));
+      pixels.data[index] = value; pixels.data[index + 1] = value; pixels.data[index + 2] = value; pixels.data[index + 3] = 255;
+    }
+    context.putImageData(pixels, 0, 0); return canvas;
+  } finally { URL.revokeObjectURL(url); }
+}
+
+async function recognizeImage(source: File, update: (progress: OcrProgress) => void) {
+  const { createWorker, OEM, PSM } = await import("tesseract.js");
   const base = `${location.origin}${import.meta.env.BASE_URL}`;
   const worker = await createWorker(["eng", "chi_tra"], OEM.LSTM_ONLY, {
     workerPath: `${base}tesseract-worker.min.js`, langPath: `${base}tessdata`,
@@ -204,7 +255,19 @@ async function recognizeImage(source: File | HTMLCanvasElement, update: (progres
     logger: (message) => {
     if (message.status === "recognizing text") update({ label: "辨認圖片文字", percent: Math.round(message.progress * 100) });
   } });
-  try { const result = await worker.recognize(source); return result.data.text; }
+  try {
+    const result = await worker.recognize(source);
+    update({ label: "辨認右側數量", percent: 90 });
+    const quantityCanvas = await imageQuantityColumn(source);
+    await worker.setParameters({ tessedit_pageseg_mode: PSM.SPARSE_TEXT, tessedit_char_whitelist: "0123456789" });
+    const quantityResult = await worker.recognize(quantityCanvas, {}, { text: true, tsv: true });
+    const quantities = (quantityResult.data.tsv ?? "").split(/\r?\n/).flatMap((row) => {
+      const fields = row.split("\t"); if (fields[0] !== "5") return [];
+      const left = Number(fields[6]); const confidence = Number(fields[10]); const value = Number(fields.slice(11).join("\t").trim());
+      return left > quantityCanvas.width * .62 && confidence >= 70 && Number.isInteger(value) && value > 0 && value <= 999 ? [value] : [];
+    });
+    return { text: result.data.text, quantities };
+  }
   finally { await worker.terminate(); }
 }
 
@@ -324,10 +387,12 @@ function Stockcheck({ session, workspace, workspaces, changeWorkspace, reloadWor
     let failureStage = "FILE";
     try {
       let text = "";
+      let imageQuantities: number[] = [];
       const candidates = recognitionProducts(items);
       if (isImage) {
         failureStage = "IMAGE-OCR";
-        text = await recognizeImage(file, setOcrProgress);
+        const recognized = await recognizeImage(file, setOcrProgress);
+        text = recognized.text; imageQuantities = recognized.quantities;
       } else {
         failureStage = "PDF-ENGINE";
         const pdfjs = await import("pdfjs-dist/legacy/build/pdf.mjs");
@@ -379,7 +444,11 @@ function Stockcheck({ session, workspace, workspaces, changeWorkspace, reloadWor
         }
       }
       setOcrProgress({ label: "配對產品及數量", percent: 100 });
-      const matches = documentMatches(text, candidates).map((line) => {
+      const productMatches = isImage ? documentProductMatches(text, candidates) : [];
+      const detectedMatches = imageQuantities.length && productMatches.length
+        ? productMatches.slice(0, imageQuantities.length).map((productId, index) => ({ productId, pieces: imageQuantities[index], unitMode: "package" as UnitMode }))
+        : documentMatches(text, candidates);
+      const matches = detectedMatches.map((line) => {
         const template = catalogItems.find((item) => item.id === line.productId);
         if (!template) return line;
         return { ...line, productId: "", draft: { category: template.category, brand: template.brand, flavor: template.flavor, name: template.name, spec: template.spec, unit: template.unit, pack_size: template.pack_size, low_stock_level: 0 } };
