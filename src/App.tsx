@@ -21,7 +21,7 @@ type OcrProgress = { label: string; percent: number };
 
 const today = () => new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Hong_Kong" });
 const publisherId = import.meta.env.VITE_ADSENSE_PUBLISHER_ID ?? "";
-const appVersion = "2026.08.14.1";
+const appVersion = "2026.08.14.2";
 
 function useLatestAppVersion() {
   useEffect(() => {
@@ -85,14 +85,33 @@ function PublicHome() {
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
   const [privacy, setPrivacy] = useState(false);
+  const [cooldown, setCooldown] = useState(0);
+
+  useEffect(() => {
+    if (!cooldown) return;
+    const timer = window.setTimeout(() => setCooldown((value) => Math.max(0, value - 1)), 1000);
+    return () => window.clearTimeout(timer);
+  }, [cooldown]);
 
   const signIn = async () => {
     if (!email.includes("@")) return setMessage("請輸入正確電郵地址");
+    if (cooldown) return;
     setBusy(true);
     const redirectTo = `${location.origin}${import.meta.env.BASE_URL}`;
     const { error } = await supabase.auth.signInWithOtp({ email, options: { shouldCreateUser: true, emailRedirectTo: redirectTo } });
     setBusy(false);
-    setMessage(error ? "暫時未能寄出登入連結，請稍後再試。" : "登入連結已寄出，請檢查電郵。 ");
+    if (error) {
+      console.error("Magic link request failed", { code: error.code, status: error.status });
+      if (error.status === 429 || error.code === "over_email_send_rate_limit") {
+        setCooldown(60);
+        setMessage("登入電郵已達 Supabase 發送上限。請勿再連續按，約一小時後再試。");
+      } else {
+        setMessage(`暫時未能寄出登入連結${error.code ? `（${error.code}）` : ""}，請稍後再試。`);
+      }
+      return;
+    }
+    setCooldown(60);
+    setMessage("登入連結已寄出，請檢查電郵；60 秒內毋須再次發送。");
   };
 
   return <main className="public-shell">
@@ -102,8 +121,8 @@ function PublicHome() {
       <p>每間店舖有獨立庫存，邀請同事後即可多人同步盤點；其他店舖無法查看你嘅資料。</p>
       <div className="feature-grid"><span>✓ 每日 Stock Take</span><span>✓ 新產品及入貨</span><span>✓ PDF／圖片本機辨認</span><span>✓ 操作記錄</span></div>
       <label className="login-field">登入／開設帳戶<input type="email" inputMode="email" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="name@example.com" /></label>
-      <button className="primary-button" onClick={signIn} disabled={busy}>{busy ? "寄出中…" : "寄出安全登入連結"}</button>
-      {message && <p className="form-message">{message}</p>}
+      <button className="primary-button" onClick={signIn} disabled={busy || cooldown > 0}>{busy ? "寄出中…" : cooldown ? `請等 ${cooldown} 秒` : "寄出安全登入連結"}</button>
+      {message && <p className="form-message" aria-live="polite">{message}</p>}
       <button className="text-button" onClick={() => setPrivacy(true)}>私隱政策</button>
     </section>
     {privacy && <PrivacyDialog close={() => setPrivacy(false)} />}
