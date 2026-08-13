@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { Session } from "@supabase/supabase-js";
 import { isConfigured, supabase } from "./supabase";
+import { seedProducts } from "./catalog";
 
 type InventoryItem = {
   id: string; category: string; brand: string; flavor: string; name: string;
@@ -12,7 +13,12 @@ type Workspace = { id: string; name: string; role: "owner" | "admin" | "member" 
 type WorkspaceMember = { user_id: string; email: string; role: string };
 type Tab = "count" | "stock" | "inbound" | "activity";
 type UnitMode = "package" | "base";
-type PdfLine = { productId: string; pieces: number; unitMode: UnitMode };
+type ProductDraft = {
+  category: string; brand: string; flavor: string; name: string; spec: string;
+  unit: string; pack_size: number; low_stock_level: number;
+};
+type PdfLine = { productId: string; pieces: number; unitMode: UnitMode; draft?: ProductDraft };
+type RecognizableProduct = Pick<InventoryItem, "id" | "category" | "brand" | "flavor" | "name" | "spec" | "unit" | "pack_size">;
 type NewProduct = {
   category: string; brand: string; flavor: string; name: string; spec: string;
   unit: string; packSize: string; initialPieces: string; lowStockLevel: string;
@@ -21,7 +27,7 @@ type OcrProgress = { label: string; percent: number };
 
 const today = () => new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Hong_Kong" });
 const publisherId = import.meta.env.VITE_ADSENSE_PUBLISHER_ID ?? "";
-const appVersion = "2026.08.14.2";
+const appVersion = "2026.08.14.3";
 
 function useLatestAppVersion() {
   useEffect(() => {
@@ -134,8 +140,19 @@ function PrivacyDialog({ close }: { close: () => void }) {
 }
 
 const normalizeOcr = (value: string) => value.normalize("NFKC").toLowerCase().replace(/[^\p{L}\p{N}]/gu, "");
+const catalogItems: RecognizableProduct[] = seedProducts.map((item) => ({
+  id: `catalog:${item.id}`, category: item.category, brand: item.brand, flavor: item.flavor,
+  name: item.name, spec: item.spec, unit: item.unit, pack_size: item.packSize,
+}));
+const productIdentity = (item: Pick<RecognizableProduct, "brand" | "flavor" | "name" | "spec">) =>
+  [item.brand, item.flavor, item.name, item.spec].map(normalizeOcr).join("|");
 
-function recognitionAliases(item: InventoryItem) {
+function recognitionProducts(items: InventoryItem[]) {
+  const existing = new Set(items.map(productIdentity));
+  return [...items, ...catalogItems.filter((item) => !existing.has(productIdentity(item)))];
+}
+
+function recognitionAliases(item: RecognizableProduct) {
   const aliases = [item.brand, item.flavor, item.name, item.spec];
   const brand = item.brand.toLowerCase(); const flavor = item.flavor;
   if (brand.includes("lay")) aliases.push(flavor.includes("洋蔥") ? "sour cream onion" : flavor.includes("原味") ? "classic potato chips" : "lay's");
@@ -148,7 +165,7 @@ function recognitionAliases(item: InventoryItem) {
   return [...new Set(aliases.map(normalizeOcr).filter((value) => value.length >= 2))];
 }
 
-function documentMatches(text: string, items: InventoryItem[]) {
+function documentMatches(text: string, items: RecognizableProduct[]) {
   const rawLines = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
   const candidates = rawLines.map((line, index) => {
     const ownNumbers = [...line.matchAll(/(?:^|\s)(\d{1,3})(?=\s|$)/g)].map((match) => Number(match[1])).filter((value) => value > 0);
@@ -180,7 +197,11 @@ function documentMatches(text: string, items: InventoryItem[]) {
 
 async function recognizeImage(source: File | HTMLCanvasElement, update: (progress: OcrProgress) => void) {
   const { createWorker, OEM } = await import("tesseract.js");
-  const worker = await createWorker(["eng", "chi_tra"], OEM.LSTM_ONLY, { logger: (message) => {
+  const base = `${location.origin}${import.meta.env.BASE_URL}`;
+  const worker = await createWorker(["eng", "chi_tra"], OEM.LSTM_ONLY, {
+    workerPath: `${base}tesseract-worker.min.js`, langPath: `${base}tessdata`,
+    corePath: `${base}tesseract-core`, workerBlobURL: false,
+    logger: (message) => {
     if (message.status === "recognizing text") update({ label: "辨認圖片文字", percent: Math.round(message.progress * 100) });
   } });
   try { const result = await worker.recognize(source); return result.data.text; }
@@ -300,31 +321,45 @@ function Stockcheck({ session, workspace, workspaces, changeWorkspace, reloadWor
     const isImage = file.type.startsWith("image/") || /\.(jpe?g|png)$/i.test(file.name);
     if (!isPdf && !isImage) return setToast("請選擇 PDF、JPG、JPEG 或 PNG");
     setPdfBusy(true); setOcrProgress({ label: "準備讀取檔案", percent: 0 });
+    let failureStage = "FILE";
     try {
       let text = "";
+      const candidates = recognitionProducts(items);
       if (isImage) {
+        failureStage = "IMAGE-OCR";
         text = await recognizeImage(file, setOcrProgress);
       } else {
+        failureStage = "PDF-ENGINE";
         const pdfjs = await import("pdfjs-dist/legacy/build/pdf.mjs");
         pdfjs.GlobalWorkerOptions.workerSrc = new URL("pdfjs-dist/legacy/build/pdf.worker.min.mjs", import.meta.url).toString();
+        failureStage = "PDF-OPEN";
         const pdfDocument = await pdfjs.getDocument({ data: new Uint8Array(await file.arrayBuffer()) }).promise;
         let embeddedText = "";
         for (let pageNo = 1; pageNo <= pdfDocument.numPages; pageNo++) {
+          failureStage = `PDF-TEXT-${pageNo}`;
           setOcrProgress({ label: `讀取 PDF 第 ${pageNo}/${pdfDocument.numPages} 頁`, percent: Math.round(pageNo / pdfDocument.numPages * 20) });
           const page = await pdfDocument.getPage(pageNo); const content = await page.getTextContent();
           embeddedText += "\n" + content.items.map((part) => "str" in part ? part.str : "").join(" ");
         }
-        const embeddedMatches = documentMatches(embeddedText, items);
-        if (embeddedMatches.length >= Math.min(3, items.length)) text = embeddedText;
+        const embeddedMatches = documentMatches(embeddedText, candidates);
+        if (embeddedMatches.length >= 20) text = embeddedText;
         else {
+          failureStage = "OCR-START";
           const { createWorker, OEM } = await import("tesseract.js");
-          const worker = await createWorker(["eng", "chi_tra"], OEM.LSTM_ONLY, { logger: (message) => {
+          const base = `${location.origin}${import.meta.env.BASE_URL}`;
+          const worker = await createWorker(["eng", "chi_tra"], OEM.LSTM_ONLY, {
+            workerPath: `${base}tesseract-worker.min.js`, langPath: `${base}tessdata`,
+            corePath: `${base}tesseract-core`, workerBlobURL: false,
+            logger: (message) => {
             if (message.status === "recognizing text") setOcrProgress((current) => ({ label: current?.label ?? "辨認 PDF", percent: Math.min(99, 20 + Math.round(message.progress * 80)) }));
           } });
           try {
             for (let pageNo = 1; pageNo <= pdfDocument.numPages; pageNo++) {
+              failureStage = `OCR-PAGE-${pageNo}`;
               setOcrProgress({ label: `OCR 辨認第 ${pageNo}/${pdfDocument.numPages} 頁`, percent: Math.round(20 + (pageNo - 1) / pdfDocument.numPages * 80) });
-              const page = await pdfDocument.getPage(pageNo); const viewport = page.getViewport({ scale: 2 });
+              const page = await pdfDocument.getPage(pageNo);
+              const mobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
+              const viewport = page.getViewport({ scale: mobile ? 1.6 : 1.7 });
               const canvas = document.createElement("canvas"); canvas.width = Math.ceil(viewport.width); canvas.height = Math.ceil(viewport.height);
               const context = canvas.getContext("2d", { alpha: false }); if (!context) throw new Error("Canvas unavailable");
               await page.render({ canvas, canvasContext: context, viewport }).promise;
@@ -334,19 +369,31 @@ function Stockcheck({ session, workspace, workspaces, changeWorkspace, reloadWor
         }
       }
       setOcrProgress({ label: "配對產品及數量", percent: 100 });
-      const matches = documentMatches(text, items);
+      const matches = documentMatches(text, candidates).map((line) => {
+        const template = catalogItems.find((item) => item.id === line.productId);
+        if (!template) return line;
+        return { ...line, productId: "", draft: { category: template.category, brand: template.brand, flavor: template.flavor, name: template.name, spec: template.spec, unit: template.unit, pack_size: template.pack_size, low_stock_level: 0 } };
+      });
       setPdf({ filename: file.name, orderNumber: text.replace(/\s/g, "").match(/H\d{12}/i)?.[0]?.toUpperCase() ?? "", lines: matches });
       setToast(matches.length ? `已辨認 ${matches.length} 款，請逐項核對` : "未能自動配對，請喺核對頁手動加入產品");
-    } catch (error) { console.error(error); setToast("未能讀取檔案，請確認圖片清晰或重試"); }
+    } catch (error) { console.error("Document import failed", { stage: failureStage, error }); setToast(`未能讀取檔案（${failureStage}），請重試`); }
     finally { setPdfBusy(false); setOcrProgress(null); if (fileRef.current) fileRef.current.value = ""; }
   };
 
   const confirmPdf = async () => {
     if (!pdf?.lines.length) return; setBusy("pdf");
-    const rows = pdf.lines.filter((line) => line.pieces > 0).map((line) => {
-      const item = items.find((entry) => entry.id === line.productId)!;
+    const newLines = pdf.lines.filter((line) => line.draft);
+    const createdIds = new Map<number, string>();
+    if (newLines.length) {
+      const drafts = newLines.map((line) => ({ workspace_id: workspace.id, ...line.draft!, created_by: session.user.id }));
+      const { data: created, error: productError } = await supabase.from("products").insert(drafts).select("id");
+      if (productError || created?.length !== newLines.length) { setBusy(null); return setToast("未能由訂單建立新產品，庫存未有更新"); }
+      newLines.forEach((line, index) => createdIds.set(pdf.lines.indexOf(line), created[index].id));
+    }
+    const rows = pdf.lines.filter((line) => line.pieces > 0).map((line, index) => {
+      const item = line.draft ?? items.find((entry) => entry.id === line.productId)!;
       const unitsAdded = line.unitMode === "package" ? line.pieces * item.pack_size : line.pieces;
-      return { workspace_id: workspace.id, product_id: item.id, pieces: line.unitMode === "package" ? line.pieces : 1, units_added: unitsAdded, entered_quantity: line.pieces, entered_unit: line.unitMode === "package" ? "箱／包" : item.unit, source: `上載檔案: ${pdf.filename}`, order_number: pdf.orderNumber || null, added_by: session.user.id, added_by_email: session.user.email };
+      return { workspace_id: workspace.id, product_id: line.draft ? createdIds.get(index)! : line.productId, pieces: line.unitMode === "package" ? line.pieces : 1, units_added: unitsAdded, entered_quantity: line.pieces, entered_unit: line.unitMode === "package" ? "箱／包" : item.unit, source: `上載檔案: ${pdf.filename}`, order_number: pdf.orderNumber || null, added_by: session.user.id, added_by_email: session.user.email };
     });
     const { error } = await supabase.from("stock_ins").insert(rows);
     setBusy(null); if (error) return setToast(error.code === "23505" ? "呢張訂單已經入過貨" : "未能確認檔案入貨");
@@ -359,7 +406,7 @@ function Stockcheck({ session, workspace, workspaces, changeWorkspace, reloadWor
     <section className="summary-card"><div><span>今日盤點</span><strong>{doneToday}<small> / {items.length}</small></strong></div><div className="progress"><i style={{ width: `${items.length ? doneToday / items.length * 100 : 0}%` }} /></div><div className="summary-row"><span>{today()}</span><span className={lowStock ? "warning" : "good"}>{lowStock ? `${lowStock} 款低存量` : "庫存正常"}</span></div></section>
     {(tab === "count" || tab === "stock") && <label className="search"><span>⌕</span><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜尋品牌、味道或產品" /></label>}
 
-    {tab === "count" && <section className="content-section"><div className="section-heading"><div><p className="eyebrow">按種類排列</p><h2>每日盤點</h2></div><span>{items.length - doneToday} 款未完成</span></div>{!items.length && <EmptyProducts open={() => { setTab("inbound"); setShowNewProduct(true); }} />}<div className="category-list">{groups.map(([category, products]) => { const complete = products.filter((item) => item.stocktake_date === today()).length; const open = expanded === category || Boolean(query); return <article className="category" key={category}><button className="category-head" onClick={() => setExpanded(open && !query ? null : category)}><span className="category-icon">{category.slice(0, 1)}</span><span><strong>{category}</strong><small>{products.length} 款產品</small></span><span className={complete === products.length ? "done-pill" : "count-pill"}>{complete}/{products.length}</span><b>{open ? "−" : "+"}</b></button>{open && <div className="product-list">{products.map((item) => <ProductCountCard key={item.id} item={item} value={counts[item.id] ?? ""} unitMode={countUnits[item.id] ?? "base"} onUnitChange={(unitMode) => setCountUnits((all) => ({ ...all, [item.id]: unitMode }))} onChange={(value) => setCounts((all) => ({ ...all, [item.id]: value }))} onSave={() => saveCount(item)} busy={busy === item.id} />)}</div>}</article>; })}</div></section>}
+    {tab === "count" && <section className="content-section"><div className="section-heading"><div><p className="eyebrow">按種類排列</p><h2>每日盤點</h2></div><span>{items.length - doneToday} 款未完成</span></div>{!items.length && <EmptyProducts open={() => setTab("inbound")} />}<div className="category-list">{groups.map(([category, products]) => { const complete = products.filter((item) => item.stocktake_date === today()).length; const open = expanded === category || Boolean(query); return <article className="category" key={category}><button className="category-head" onClick={() => setExpanded(open && !query ? null : category)}><span className="category-icon">{category.slice(0, 1)}</span><span><strong>{category}</strong><small>{products.length} 款產品</small></span><span className={complete === products.length ? "done-pill" : "count-pill"}>{complete}/{products.length}</span><b>{open ? "−" : "+"}</b></button>{open && <div className="product-list">{products.map((item) => <ProductCountCard key={item.id} item={item} value={counts[item.id] ?? ""} unitMode={countUnits[item.id] ?? "base"} onUnitChange={(unitMode) => setCountUnits((all) => ({ ...all, [item.id]: unitMode }))} onChange={(value) => setCounts((all) => ({ ...all, [item.id]: value }))} onSave={() => saveCount(item)} busy={busy === item.id} />)}</div>}</article>; })}</div></section>}
 
     {tab === "stock" && <section className="content-section"><div className="section-heading"><div><p className="eyebrow">即時共享</p><h2>庫存清單</h2></div><span>{filtered.length} 款</span></div><div className="stock-list">{groups.map(([category, products]) => <section key={category}><h3>{category}</h3>{products.map((item) => <div className="stock-row" key={item.id}><div><strong>{item.brand} · {item.flavor}</strong><span>{item.name}｜{item.spec}</span></div><div className={item.current_qty <= item.low_stock_level ? "qty low" : "qty"}><strong>{item.current_qty}</strong><small>{item.unit}</small></div></div>)}</section>)}</div></section>}
 
@@ -376,7 +423,7 @@ function Stockcheck({ session, workspace, workspaces, changeWorkspace, reloadWor
   </main>;
 }
 
-function EmptyProducts({ open }: { open: () => void }) { return <div className="empty-card"><strong>未有產品</strong><p>先新增第一樣貨，之後所有裝置都會同步見到。</p><button className="primary-button" onClick={open}>新增產品</button></div>; }
+function EmptyProducts({ open }: { open: () => void }) { return <div className="empty-card"><strong>未有產品</strong><p>可以上載第一張訂單自動建立產品，或者手動新增。</p><button className="primary-button" onClick={open}>前往入貨</button></div>; }
 
 function ProductCountCard({ item, value, unitMode, onUnitChange, onChange, onSave, busy }: { item: InventoryItem; value: string; unitMode: UnitMode; onUnitChange: (v: UnitMode) => void; onChange: (v: string) => void; onSave: () => void; busy: boolean }) {
   const done = item.stocktake_date === today();
@@ -440,17 +487,25 @@ function WorkspaceDialog({ session, workspace, workspaces, changeWorkspace, relo
 }
 
 function UploadReview({ pdf, items, setPdf, confirm, busy }: { pdf: { filename: string; orderNumber: string; lines: PdfLine[] }; items: InventoryItem[]; setPdf: (value: typeof pdf | null) => void; confirm: () => void; busy: boolean }) {
-  const totalUnits = pdf.lines.reduce((sum, line) => { const item = items.find((entry) => entry.id === line.productId); return sum + (line.unitMode === "package" ? line.pieces * (item?.pack_size ?? 0) : line.pieces); }, 0);
+  const lineProduct = (line: PdfLine) => line.draft ?? items.find((entry) => entry.id === line.productId);
+  const totalUnits = pdf.lines.reduce((sum, line) => { const item = lineProduct(line); return sum + (line.unitMode === "package" ? line.pieces * (item?.pack_size ?? 0) : line.pieces); }, 0);
   const updateLine = (index: number, next: Partial<PdfLine>) => { const lines = [...pdf.lines]; lines[index] = { ...lines[index], ...next }; setPdf({ ...pdf, lines }); };
+  const updateDraft = (index: number, key: keyof ProductDraft, value: string | number) => {
+    const line = pdf.lines[index]; if (!line.draft) return;
+    updateLine(index, { draft: { ...line.draft, [key]: value } });
+  };
   const removeLine = (index: number) => setPdf({ ...pdf, lines: pdf.lines.filter((_line, lineIndex) => lineIndex !== index) });
-  const addLine = () => { if (!items[0]) return; setPdf({ ...pdf, lines: [...pdf.lines, { productId: items[0].id, pieces: 1, unitMode: "package" }] }); };
+  const addLine = () => setPdf({ ...pdf, lines: [...pdf.lines, items[0]
+    ? { productId: items[0].id, pieces: 1, unitMode: "package" }
+    : { productId: "", pieces: 1, unitMode: "package", draft: { category: "其他", brand: "", flavor: "原味", name: "", spec: "", unit: "件", pack_size: 1, low_stock_level: 0 } }] });
+  const invalid = pdf.lines.some((line) => line.pieces <= 0 || (!line.draft && !line.productId) || (line.draft && (![line.draft.category, line.draft.brand, line.draft.flavor, line.draft.name, line.draft.unit].every((value) => value.trim()) || line.draft.pack_size < 1)));
   return <div className="review-page">
     <header className="review-topbar"><button onClick={() => setPdf(null)}>← 取消</button><div><p className="eyebrow">未更新庫存</p><h2>資料核對</h2></div><span>{pdf.lines.length} 項</span></header>
     <section className="review-summary"><div><span>上載檔案</span><strong>{pdf.filename}</strong></div><label>訂單編號<input value={pdf.orderNumber} onChange={(event) => setPdf({ ...pdf, orderNumber: event.target.value })} placeholder="如有訂單編號請填寫" /></label><div className="review-totals"><span>辨認項目 <b>{pdf.lines.length}</b></span><span>預計新增 <b>{totalUnits}</b> 件</span></div></section>
     <section className="review-list"><div className="review-heading"><div><p className="eyebrow">逐項確認</p><h3>產品及數量</h3></div><button className="outline-button" onClick={addLine}>＋ 加漏咗嘅貨</button></div>
       {!pdf.lines.length && <div className="empty-card"><strong>未辨認到產品</strong><p>按「加漏咗嘅貨」手動加入，再確認入庫。</p></div>}
-      {pdf.lines.map((line, index) => { const item = items.find((entry) => entry.id === line.productId); const converted = line.unitMode === "package" ? line.pieces * (item?.pack_size ?? 0) : line.pieces; return <article className="review-item" key={`${index}-${line.productId}`}><div className="review-item-number">{index + 1}</div><div className="review-fields"><label>產品<select value={line.productId} onChange={(event) => updateLine(index, { productId: event.target.value })}>{items.map((entry) => <option key={entry.id} value={entry.id}>{entry.category}｜{entry.brand}｜{entry.flavor}</option>)}</select></label><div className="review-quantity"><label>數量<input inputMode="numeric" value={line.pieces} onChange={(event) => updateLine(index, { pieces: Math.max(0, Number(event.target.value.replace(/\D/g, ""))) })} /></label><label>輸入單位<select value={line.unitMode} onChange={(event) => updateLine(index, { unitMode: event.target.value as UnitMode })}><option value="package">箱／包</option><option value="base">{item?.unit ?? "件"}</option></select></label><div><span>自動換算</span><strong>{converted} {item?.unit}</strong></div></div></div><button className="remove-button" onClick={() => removeLine(index)} aria-label="刪除項目">×</button></article>; })}
+      {pdf.lines.map((line, index) => { const item = lineProduct(line); const converted = line.unitMode === "package" ? line.pieces * (item?.pack_size ?? 0) : line.pieces; return <article className="review-item" key={`${index}-${line.productId}`}><div className="review-item-number">{index + 1}</div><div className="review-fields">{line.draft ? <div className="generated-product"><div className="generated-product-title"><span>PDF 自動建立新產品</span><b>請核對</b></div><div className="two-fields"><label>種類<input value={line.draft.category} onChange={(event) => updateDraft(index, "category", event.target.value)} /></label><label>品牌<input value={line.draft.brand} onChange={(event) => updateDraft(index, "brand", event.target.value)} /></label></div><div className="two-fields"><label>味道<input value={line.draft.flavor} onChange={(event) => updateDraft(index, "flavor", event.target.value)} /></label><label>產品名稱<input value={line.draft.name} onChange={(event) => updateDraft(index, "name", event.target.value)} /></label></div><div className="three-fields"><label>規格<input value={line.draft.spec} onChange={(event) => updateDraft(index, "spec", event.target.value)} /></label><label>基本單位<input value={line.draft.unit} onChange={(event) => updateDraft(index, "unit", event.target.value)} /></label><label>每箱／包數量<input inputMode="numeric" value={line.draft.pack_size} onChange={(event) => updateDraft(index, "pack_size", Math.max(1, Number(event.target.value.replace(/\D/g, ""))))} /></label></div></div> : <label>現有產品<select value={line.productId} onChange={(event) => updateLine(index, { productId: event.target.value })}>{items.map((entry) => <option key={entry.id} value={entry.id}>{entry.category}｜{entry.brand}｜{entry.flavor}</option>)}</select></label>}<div className="review-quantity"><label>數量<input inputMode="numeric" value={line.pieces} onChange={(event) => updateLine(index, { pieces: Math.max(0, Number(event.target.value.replace(/\D/g, ""))) })} /></label><label>輸入單位<select value={line.unitMode} onChange={(event) => updateLine(index, { unitMode: event.target.value as UnitMode })}><option value="package">箱／包</option><option value="base">{item?.unit ?? "件"}</option></select></label><div><span>自動換算</span><strong>{converted} {item?.unit}</strong></div></div></div><button className="remove-button" onClick={() => removeLine(index)} aria-label="刪除項目">×</button></article>; })}
     </section>
-    <footer className="review-footer"><div><span>確認後更新共享 Database</span><strong>{pdf.lines.length} 項 · {totalUnits} 件</strong></div><button className="primary-button" onClick={confirm} disabled={busy || !pdf.lines.length || pdf.lines.some((line) => line.pieces <= 0)}>{busy ? "同步中…" : "確認全部入庫"}</button></footer>
+    <footer className="review-footer"><div><span>確認後先建立新產品，再更新共享 Database</span><strong>{pdf.lines.length} 項 · {totalUnits} 件</strong></div><button className="primary-button" onClick={confirm} disabled={busy || !pdf.lines.length || invalid}>{busy ? "同步中…" : "確認全部入庫"}</button></footer>
   </div>;
 }
