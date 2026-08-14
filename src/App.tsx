@@ -32,7 +32,7 @@ type OcrProgress = { label: string; percent: number };
 
 const today = () => new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Hong_Kong" });
 const publisherId = import.meta.env.VITE_ADSENSE_PUBLISHER_ID ?? "";
-const appVersion = "2026.08.14.12";
+const appVersion = "2026.08.14.13";
 
 function useLatestAppVersion() {
   useEffect(() => {
@@ -412,6 +412,7 @@ function Stockcheck({ session, workspace, workspaces, changeWorkspace, reloadWor
   const [editingProduct, setEditingProduct] = useState<InventoryItem | null>(null);
   const [correctingEntry, setCorrectingEntry] = useState<Activity | null>(null);
   const [showWorkspace, setShowWorkspace] = useState(false);
+  const [showCategoryManager, setShowCategoryManager] = useState(false);
   const [pdf, setPdf] = useState<{ filename: string; orderNumber: string; lines: PdfLine[] } | null>(null);
   const [pdfBusy, setPdfBusy] = useState(false);
   const [ocrProgress, setOcrProgress] = useState<OcrProgress | null>(null);
@@ -582,7 +583,7 @@ function Stockcheck({ session, workspace, workspaces, changeWorkspace, reloadWor
 
     {tab === "count" && <section className="content-section"><div className="section-heading"><div><p className="eyebrow">主分類 → 子分類</p><h2>每日盤點</h2></div><span>{items.length - doneToday} 款未完成</span></div>{!items.length && <EmptyProducts open={() => setTab("inbound")} />}<div className="category-list">{groups.map(([category, products]) => { const complete = products.filter((item) => item.stocktake_date === today()).length; const open = expanded === category || Boolean(query); return <article className="category" key={category}><button className="category-head" onClick={() => setExpanded(open && !query ? null : category)}><span className="category-icon">{category.slice(0, 1)}</span><span><strong>{category}</strong><small>{subgroups(products).length} 個子分類 · {products.length} 款產品</small></span><span className={complete === products.length ? "done-pill" : "count-pill"}>{complete}/{products.length}</span><b>{open ? "−" : "+"}</b></button>{open && <div className="product-list">{subgroups(products).map(([subcategory, childProducts]) => <section className="subcategory-group" key={subcategory}><h4>{subcategory}</h4>{childProducts.map((item) => <ProductCountCard key={item.id} item={item} value={counts[item.id] ?? ""} unitMode={countUnits[item.id] ?? "base"} onUnitChange={(unitMode) => setCountUnits((all) => ({ ...all, [item.id]: unitMode }))} onChange={(value) => setCounts((all) => ({ ...all, [item.id]: value }))} onSave={() => saveCount(item)} busy={busy === item.id} />)}</section>)}</div>}</article>; })}</div></section>}
 
-    {tab === "stock" && <section className="content-section"><div className="section-heading"><div><p className="eyebrow">主分類 → 子分類</p><h2>庫存清單</h2></div><span>{filtered.length} 款</span></div><div className="stock-list">{groups.map(([category, products]) => <section key={category}><h3>{category}</h3>{subgroups(products).map(([subcategory, childProducts]) => <div className="stock-subcategory" key={subcategory}><h4>{subcategory}</h4>{childProducts.map((item) => <button className="stock-row stock-edit-row" key={item.id} onClick={() => setEditingProduct(item)}><div><strong>{item.brand} · {item.flavor}</strong><span>{item.name}｜{item.spec}</span></div><div className={item.current_qty <= item.low_stock_level ? "qty low" : "qty"}><strong>{item.current_qty}</strong><small>{item.unit} · 編輯 ›</small></div></button>)}</div>)}</section>)}</div></section>}
+    {tab === "stock" && <section className="content-section"><div className="section-heading"><div><p className="eyebrow">主分類 → 子分類</p><h2>庫存清單</h2></div><div className="section-actions"><span>{filtered.length} 款</span>{workspace.role !== "member" && <button className="outline-button" onClick={() => setShowCategoryManager(true)}>分類設定</button>}</div></div><div className="stock-list">{groups.map(([category, products]) => <section key={category}><h3>{category}</h3>{subgroups(products).map(([subcategory, childProducts]) => <div className="stock-subcategory" key={subcategory}><h4>{subcategory}</h4>{childProducts.map((item) => <button className="stock-row stock-edit-row" key={item.id} onClick={() => setEditingProduct(item)}><div><strong>{item.brand} · {item.flavor}</strong><span>{item.name}｜{item.spec}</span></div><div className={item.current_qty <= item.low_stock_level ? "qty low" : "qty"}><strong>{item.current_qty}</strong><small>{item.unit} · 編輯 ›</small></div></button>)}</div>)}</section>)}</div></section>}
 
     {tab === "inbound" && <section className="content-section"><div className="section-heading"><div><p className="eyebrow">增加庫存</p><h2>新貨入庫</h2></div><button className="outline-button" onClick={() => setShowNewProduct(true)}>＋ 新增產品</button></div><div className="form-card"><label>現有產品<select value={stockIn.productId} onChange={(event) => setStockIn({ ...stockIn, productId: event.target.value })}><option value="">請選擇</option>{items.map((item) => <option value={item.id} key={item.id}>{item.category}｜{item.brand}｜{item.flavor}</option>)}</select></label><div className="quantity-unit-row"><label>新增數量<input inputMode="numeric" value={stockIn.pieces} onChange={(event) => setStockIn({ ...stockIn, pieces: event.target.value.replace(/\D/g, "") })} /></label><label>輸入單位<select value={stockIn.unitMode} onChange={(event) => setStockIn({ ...stockIn, unitMode: event.target.value as UnitMode })}><option value="package">箱／包</option><option value="base">{items.find((item) => item.id === stockIn.productId)?.unit ?? "件"}</option></select></label></div>{stockIn.productId && <div className="conversion-note">自動換算：<strong>{stockIn.unitMode === "package" ? Number(stockIn.pieces || 0) * (items.find((item) => item.id === stockIn.productId)?.pack_size ?? 0) : Number(stockIn.pieces || 0)}</strong> {items.find((item) => item.id === stockIn.productId)?.unit}</div>}<label>來源<input value={stockIn.source} onChange={(event) => setStockIn({ ...stockIn, source: event.target.value })} /></label><button className="primary-button" onClick={saveInbound} disabled={busy === "inbound"}>{busy === "inbound" ? "儲存中…" : "確認入貨"}</button></div><div className="pdf-card"><div className="pdf-icon">OCR</div><div><strong>從 PDF 或相片辨認</strong><p>支援 PDF、JPG、JPEG、PNG；完成後必須先核對，未確認唔會改庫存。</p></div><button onClick={() => fileRef.current?.click()} disabled={pdfBusy}>{pdfBusy ? `${ocrProgress?.percent ?? 0}%` : "選擇檔案"}</button><input ref={fileRef} hidden type="file" accept="application/pdf,image/jpeg,image/png,.jpg,.jpeg,.png" onChange={(event) => handleDocument(event.target.files?.[0])} /></div>{ocrProgress && <div className="ocr-progress"><div><span>{ocrProgress.label}</span><b>{ocrProgress.percent}%</b></div><i><em style={{ width: `${ocrProgress.percent}%` }} /></i><small>首次使用會下載中文及英文辨認模型，請保持網絡連線。</small></div>}</section>}
 
@@ -594,6 +595,7 @@ function Stockcheck({ session, workspace, workspaces, changeWorkspace, reloadWor
     {editingProduct && <EditProductDialog item={editingProduct} items={items} close={() => setEditingProduct(null)} saved={async () => { setEditingProduct(null); setToast("產品資料已同步到所有裝置"); await refresh(); }} />}
     {correctingEntry && <CorrectStockInDialog entry={correctingEntry} items={items} workspace={workspace} close={() => setCorrectingEntry(null)} saved={async () => { setCorrectingEntry(null); setToast("入貨記錄及庫存已更正"); await refresh(); }} />}
     {showWorkspace && <WorkspaceDialog session={session} workspace={workspace} workspaces={workspaces} changeWorkspace={changeWorkspace} reload={reloadWorkspaces} close={() => setShowWorkspace(false)} />}
+    {showCategoryManager && <CategoryManager items={items} workspace={workspace} close={() => setShowCategoryManager(false)} saved={async (count, source, target) => { setToast(`${count} 款產品已搬到「${target} → ${source}」`); await refresh(); }} />}
     {pdf && <UploadReview pdf={pdf} items={items} setPdf={setPdf} confirm={confirmPdf} busy={busy === "pdf"} />}
     {toast && <div className="toast">{toast}</div>}
   </main>;
@@ -605,6 +607,52 @@ function ExpandedChoicePicker({ label, options, value, onChange }: { label: stri
   const [custom, setCustom] = useState(Boolean(value && !options.includes(value)));
   useEffect(() => { if (value && options.includes(value)) setCustom(false); }, [value, options.join("|")]);
   return <div className="category-picker"><div className="category-picker-head"><span>{label}</span><button onClick={() => { setCustom((current) => !current); onChange(custom ? (options[0] ?? "") : ""); }}>{custom ? `顯示現有${label}` : `＋ 新增${label}`}</button></div>{custom ? <input autoFocus value={value} onChange={(event) => onChange(event.target.value)} placeholder={`輸入新${label}名稱`} /> : <div className="category-options">{options.map((option) => <button className={value === option ? "selected" : ""} onClick={() => onChange(option)} key={option}>{option}</button>)}</div>}<small>{custom ? `輸入未使用過嘅${label}名稱。` : `所有現有${label}已展開，直接點選一個。`}</small></div>;
+}
+
+function CategoryManager({ items, workspace, close, saved }: { items: InventoryItem[]; workspace: Workspace; close: () => void; saved: (count: number, source: string, target: string) => Promise<void> }) {
+  const categories = useMemo(() => [...new Set(items.map((item) => item.category))].sort((a, b) => a.localeCompare(b, "zh-HK")), [items]);
+  const [source, setSource] = useState(categories[0] ?? "");
+  const [target, setTarget] = useState(categories.find((category) => category !== source) ?? "");
+  const [customTarget, setCustomTarget] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState("");
+  const affected = items.filter((item) => item.category === source);
+  const targetChoices = categories.filter((category) => category !== source);
+  const cleanTarget = target.trim();
+
+  useEffect(() => {
+    if (categories.length && !categories.includes(source)) setSource(categories[0]);
+  }, [categories.join("|"), source]);
+  useEffect(() => {
+    if (!customTarget && (!targetChoices.includes(target) || target === source)) setTarget(targetChoices[0] ?? "");
+  }, [source, categories.join("|"), customTarget, target]);
+
+  const move = async () => {
+    if (!source || !cleanTarget || source === cleanTarget) return setMessage("請揀一個唔同嘅目標主分類");
+    setBusy(true); setMessage("");
+    const { data, error } = await supabase.rpc("move_category_to_subcategory", { target_workspace: workspace.id, source_category: source, target_category: cleanTarget });
+    setBusy(false);
+    if (error) return setMessage("未能搬移分類，請確認你有管理員權限後再試");
+    await saved(Number(data), source, cleanTarget);
+    setMessage(`完成：${Number(data)} 款產品已搬入「${cleanTarget}」`);
+  };
+
+  return <div className="review-page category-manager-page">
+    <header className="review-topbar"><button onClick={close}>← 返回</button><div><p className="eyebrow">產品目錄</p><h2>分類設定</h2></div><span>{categories.length} 個</span></header>
+    <section className="category-manager-intro"><p className="eyebrow">目前兩層結構</p><h3>主分類及子分類</h3><p>每個分類分開顯示，括號內係產品數量。呢度只整理分類，唔會改產品、庫存或記錄。</p></section>
+    <section className="category-tree">{categories.map((category) => {
+      const products = items.filter((item) => item.category === category);
+      const children = [...new Set(products.map((item) => item.subcategory || "未分類"))].sort((a, b) => a.localeCompare(b, "zh-HK"));
+      return <article key={category}><div><span className="category-icon">{category.slice(0, 1)}</span><div><strong>{category}</strong><small>{products.length} 款產品 · {children.length} 個子分類</small></div></div><div className="category-child-list">{children.map((child) => <span key={child}>{child} <b>{products.filter((item) => (item.subcategory || "未分類") === child).length}</b></span>)}</div></article>;
+    })}</section>
+    <section className="category-move-card"><p className="eyebrow">批量整理</p><h3>將現有主分類搬入子分類</h3><label>要搬嘅現有主分類<select value={source} onChange={(event) => { setSource(event.target.value); setMessage(""); }}>{categories.map((category) => <option value={category} key={category}>{category}</option>)}</select></label>
+      <div className="category-picker"><div className="category-picker-head"><span>目標主分類</span><button onClick={() => { setCustomTarget((current) => !current); setTarget(customTarget ? (targetChoices[0] ?? "") : ""); setMessage(""); }}>{customTarget ? "選擇現有主分類" : "＋ 新增主分類"}</button></div>{customTarget ? <input autoFocus value={target} onChange={(event) => setTarget(event.target.value)} placeholder="例如：零食、飲品、日用品" /> : <div className="category-options">{targetChoices.map((category) => <button className={target === category ? "selected" : ""} onClick={() => setTarget(category)} key={category}>{category}</button>)}</div>}<small>{customTarget ? "輸入新嘅大分類名稱。" : "點選一個現有大分類。"}</small></div>
+      <div className="category-preview"><span>搬移預覽</span><strong>{source || "來源分類"}（{affected.length} 款）</strong><b>↓</b><strong>{cleanTarget || "目標主分類"} → {source || "子分類"}</strong></div>
+      <div className="status-note">確認後，呢 {affected.length} 款產品會保留原有 ID、名稱、庫存、盤點、入貨及 OCR 對應。</div>
+      {message && <p className={message.startsWith("完成") ? "form-message" : "form-message error"}>{message}</p>}
+      <button className="primary-button" onClick={move} disabled={busy || !affected.length || !cleanTarget || source === cleanTarget}>{busy ? "搬移中…" : `確認搬移 ${affected.length} 款產品`}</button>
+    </section>
+  </div>;
 }
 
 function EditProductDialog({ item, items, close, saved }: { item: InventoryItem; items: InventoryItem[]; close: () => void; saved: () => Promise<void> }) {
