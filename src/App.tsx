@@ -39,7 +39,7 @@ type ExcelReview =
 
 const today = () => new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Hong_Kong" });
 const publisherId = import.meta.env.VITE_ADSENSE_PUBLISHER_ID ?? "";
-const appVersion = "2026.08.14.14";
+const appVersion = "2026.08.14.15";
 
 function useLatestAppVersion() {
   useEffect(() => {

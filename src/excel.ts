@@ -69,7 +69,7 @@ async function downloadWorkbook(workbook: import("exceljs").Workbook, filename: 
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
-export async function downloadInboundTemplate(workspaceName: string) {
+export async function buildInboundWorkbook() {
   const workbook = await createWorkbook();
   workbook.creator = "Stockcheck";
   const sheet = workbook.addWorksheet("入貨資料");
@@ -90,10 +90,14 @@ export async function downloadInboundTemplate(workspaceName: string) {
     ["注意", "數量只可使用大過 0 的整數；同一訂單不可重複匯入同一產品。"],
   ]);
   guide.getColumn(1).width = 16; guide.getColumn(2).width = 80; guide.getRow(1).font = { bold: true, size: 16, color: { argb: "FF123E34" } };
-  await downloadWorkbook(workbook, `${safeFilename(workspaceName)}_AI入貨範本.xlsx`);
+  return workbook;
 }
 
-export async function downloadStocktakeWorkbook(items: ExcelInventoryItem[], workspaceName: string, workspaceId: string, date: string) {
+export async function downloadInboundTemplate(workspaceName: string) {
+  await downloadWorkbook(await buildInboundWorkbook(), `${safeFilename(workspaceName)}_AI入貨範本.xlsx`);
+}
+
+export async function buildStocktakeWorkbook(items: ExcelInventoryItem[], workspaceId: string) {
   const workbook = await createWorkbook();
   workbook.creator = "Stockcheck";
   const sheet = workbook.addWorksheet("Stock Take");
@@ -106,7 +110,11 @@ export async function downloadStocktakeWorkbook(items: ExcelInventoryItem[], wor
   const meta = workbook.addWorksheet("Stockcheck");
   meta.addRows([["類型", "STOCKTAKE"], ["版本", "1"], ["店舖ID", workspaceId], ["匯出時間", new Date().toISOString()]]);
   meta.state = "veryHidden";
-  await downloadWorkbook(workbook, `${safeFilename(workspaceName)}_StockTake_${date}.xlsx`);
+  return workbook;
+}
+
+export async function downloadStocktakeWorkbook(items: ExcelInventoryItem[], workspaceName: string, workspaceId: string, date: string) {
+  await downloadWorkbook(await buildStocktakeWorkbook(items, workspaceId), `${safeFilename(workspaceName)}_StockTake_${date}.xlsx`);
 }
 
 function headerMap(sheet: import("exceljs").Worksheet) {
