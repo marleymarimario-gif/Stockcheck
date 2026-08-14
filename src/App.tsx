@@ -3,6 +3,7 @@ import type { Session } from "@supabase/supabase-js";
 import { isConfigured, supabase } from "./supabase";
 import { seedProducts } from "./catalog";
 import { downloadInboundTemplate, downloadStocktakeWorkbook, parseInboundWorkbook, parseStocktakeWorkbook } from "./excel";
+import "./permissions.css";
 
 type InventoryItem = {
   id: string; category: string; subcategory: string; brand: string; flavor: string; name: string;
@@ -14,10 +15,12 @@ type Activity = {
   entered_quantity: number; entered_unit: string; pack_size: number; actor_id: string;
   actor: string; happened_at: string; is_corrected: boolean; original_quantity: number | null;
   original_product_name: string | null; corrected_by_email: string | null; corrected_at: string | null;
-  source: string;
+  source: string; order_number: string | null; is_voided: boolean; voided_by_email: string | null;
+  voided_at: string | null; void_reason: string | null;
 };
-type Workspace = { id: string; name: string; role: "owner" | "admin" | "member" };
-type WorkspaceMember = { user_id: string; email: string; role: string };
+type WorkspaceRole = "owner" | "admin" | "member" | "viewer";
+type Workspace = { id: string; name: string; role: WorkspaceRole };
+type WorkspaceMember = { user_id: string; email: string; role: WorkspaceRole };
 type Tab = "count" | "stock" | "inbound" | "activity";
 type UnitMode = "package" | "base";
 type ProductDraft = {
@@ -39,7 +42,8 @@ type ExcelReview =
 
 const today = () => new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Hong_Kong" });
 const publisherId = import.meta.env.VITE_ADSENSE_PUBLISHER_ID ?? "";
-const appVersion = "2026.08.14.15";
+const appVersion = "2026.08.14.16";
+const roleLabel = (role: WorkspaceRole) => role === "owner" ? "擁有人" : role === "admin" ? "管理員" : role === "viewer" ? "只供查看" : "一般成員";
 
 function useLatestAppVersion() {
   useEffect(() => {
@@ -436,6 +440,7 @@ function Stockcheck({ session, workspace, workspaces, changeWorkspace, reloadWor
   const [showNewProduct, setShowNewProduct] = useState(false);
   const [editingProduct, setEditingProduct] = useState<InventoryItem | null>(null);
   const [correctingEntry, setCorrectingEntry] = useState<Activity | null>(null);
+  const [voidingEntry, setVoidingEntry] = useState<Activity | null>(null);
   const [showWorkspace, setShowWorkspace] = useState(false);
   const [showCategoryManager, setShowCategoryManager] = useState(false);
   const [pdf, setPdf] = useState<{ filename: string; orderNumber: string; lines: PdfLine[] } | null>(null);
@@ -459,6 +464,7 @@ function Stockcheck({ session, workspace, workspaces, changeWorkspace, reloadWor
   };
 
   useEffect(() => { setItems([]); setActivity([]); setStockIn((value) => ({ ...value, productId: "" })); refresh().catch(() => setToast("未能載入共享庫存，請稍後再試")); }, [workspace.id]);
+  useEffect(() => { if (workspace.role === "viewer" && (tab === "count" || tab === "inbound")) setTab("stock"); }, [workspace.id, workspace.role, tab]);
   useEffect(() => { if (!toast) return; const timer = setTimeout(() => setToast(""), 3000); return () => clearTimeout(timer); }, [toast]);
 
   const filtered = useMemo(() => {
@@ -477,6 +483,8 @@ function Stockcheck({ session, workspace, workspaces, changeWorkspace, reloadWor
   };
   const doneToday = items.filter((item) => item.stocktake_date === today()).length;
   const lowStock = items.filter((item) => item.current_qty <= item.low_stock_level).length;
+  const canAdmin = workspace.role === "owner" || workspace.role === "admin";
+  const canWrite = workspace.role !== "viewer";
 
   const saveCount = async (item: InventoryItem) => {
     const enteredQuantity = Number(counts[item.id]); const unitMode = countUnits[item.id] ?? "base";
@@ -549,6 +557,7 @@ function Stockcheck({ session, workspace, workspaces, changeWorkspace, reloadWor
     }
     const createdIds = new Map<number, string>();
     const newLines = review.lines.filter((line) => line.draft);
+    if (newLines.length && !canAdmin) { setBusy(null); return setToast("只有擁有人或管理員可以由 Excel 建立新產品"); }
     if (newLines.length) {
       const { data: created, error } = await supabase.from("products").insert(newLines.map((line) => ({ workspace_id: workspace.id, ...line.draft!, created_by: session.user.id }))).select("id");
       if (error || created?.length !== newLines.length) { setBusy(null); return setToast("未能建立 Excel 入面嘅新產品，庫存未有更新"); }
@@ -666,6 +675,7 @@ function Stockcheck({ session, workspace, workspaces, changeWorkspace, reloadWor
   const confirmPdf = async () => {
     if (!pdf?.lines.length) return; setBusy("pdf");
     const newLines = pdf.lines.filter((line) => line.draft);
+    if (newLines.length && !canAdmin) { setBusy(null); return setToast("只有擁有人或管理員可以由訂單建立新產品"); }
     const createdIds = new Map<number, string>();
     if (newLines.length) {
       const drafts = newLines.map((line) => ({ workspace_id: workspace.id, ...line.draft!, created_by: session.user.id }));
@@ -692,17 +702,18 @@ function Stockcheck({ session, workspace, workspaces, changeWorkspace, reloadWor
 
     {tab === "count" && <section className="content-section"><div className="section-heading"><div><p className="eyebrow">主分類 → 子分類</p><h2>每日盤點</h2></div><span>{items.length - doneToday} 款未完成</span></div><div className="excel-tool-card"><div><span className="excel-badge">XLSX</span><div><strong>Excel 批量盤點</strong><p>先匯出最新清單，填寫「盤點數量」後再匯入核對。</p></div></div><div className="excel-actions"><button onClick={() => downloadStocktakeWorkbook(items, workspace.name, workspace.id, today()).catch(() => setToast("未能建立 Stock Take Excel"))} disabled={excelBusy || !items.length}>Export 今日清單</button><button onClick={() => stocktakeExcelRef.current?.click()} disabled={excelBusy}>Import Stock Take</button><input ref={stocktakeExcelRef} hidden type="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" onChange={(event) => openStocktakeExcel(event.target.files?.[0])} /></div></div>{!items.length && <EmptyProducts open={() => setTab("inbound")} />}<div className="category-list">{groups.map(([category, products]) => { const complete = products.filter((item) => item.stocktake_date === today()).length; const open = expanded === category || Boolean(query); return <article className="category" key={category}><button className="category-head" onClick={() => setExpanded(open && !query ? null : category)}><span className="category-icon">{category.slice(0, 1)}</span><span><strong>{category}</strong><small>{subgroups(products).length} 個子分類 · {products.length} 款產品</small></span><span className={complete === products.length ? "done-pill" : "count-pill"}>{complete}/{products.length}</span><b>{open ? "−" : "+"}</b></button>{open && <div className="product-list">{subgroups(products).map(([subcategory, childProducts]) => <section className="subcategory-group" key={subcategory}><h4>{subcategory}</h4>{childProducts.map((item) => <ProductCountCard key={item.id} item={item} value={counts[item.id] ?? ""} unitMode={countUnits[item.id] ?? "base"} onUnitChange={(unitMode) => setCountUnits((all) => ({ ...all, [item.id]: unitMode }))} onChange={(value) => setCounts((all) => ({ ...all, [item.id]: value }))} onSave={() => saveCount(item)} busy={busy === item.id} />)}</section>)}</div>}</article>; })}</div></section>}
 
-    {tab === "stock" && <section className="content-section"><div className="section-heading"><div><p className="eyebrow">主分類 → 子分類</p><h2>庫存清單</h2></div><div className="section-actions"><span>{filtered.length} 款</span>{workspace.role !== "member" && <button className="outline-button" onClick={() => setShowCategoryManager(true)}>分類設定</button>}</div></div><div className="stock-list">{groups.map(([category, products]) => <section key={category}><h3>{category}</h3>{subgroups(products).map(([subcategory, childProducts]) => <div className="stock-subcategory" key={subcategory}><h4>{subcategory}</h4>{childProducts.map((item) => <button className="stock-row stock-edit-row" key={item.id} onClick={() => setEditingProduct(item)}><div><strong>{item.brand} · {item.flavor}</strong><span>{item.name}｜{item.spec}</span></div><div className={item.current_qty <= item.low_stock_level ? "qty low" : "qty"}><strong>{item.current_qty}</strong><small>{item.unit} · 編輯 ›</small></div></button>)}</div>)}</section>)}</div></section>}
+    {tab === "stock" && <section className="content-section"><div className="section-heading"><div><p className="eyebrow">主分類 → 子分類</p><h2>庫存清單</h2></div><div className="section-actions"><span>{filtered.length} 款</span>{canAdmin && <button className="outline-button" onClick={() => setShowCategoryManager(true)}>分類設定</button>}</div></div><div className="stock-list">{groups.map(([category, products]) => <section key={category}><h3>{category}</h3>{subgroups(products).map(([subcategory, childProducts]) => <div className="stock-subcategory" key={subcategory}><h4>{subcategory}</h4>{childProducts.map((item) => <button className="stock-row stock-edit-row" key={item.id} onClick={() => canAdmin && setEditingProduct(item)} disabled={!canAdmin}><div><strong>{item.brand} · {item.flavor}</strong><span>{item.name}｜{item.spec}</span></div><div className={item.current_qty <= item.low_stock_level ? "qty low" : "qty"}><strong>{item.current_qty}</strong><small>{item.unit}{canAdmin ? " · 編輯 ›" : ""}</small></div></button>)}</div>)}</section>)}</div></section>}
 
-    {tab === "inbound" && <section className="content-section"><div className="section-heading"><div><p className="eyebrow">增加庫存</p><h2>新貨入庫</h2></div><button className="outline-button" onClick={() => setShowNewProduct(true)}>＋ 新增產品</button></div><div className="form-card"><label>現有產品<select value={stockIn.productId} onChange={(event) => setStockIn({ ...stockIn, productId: event.target.value })}><option value="">請選擇</option>{items.map((item) => <option value={item.id} key={item.id}>{item.category}｜{item.brand}｜{item.flavor}</option>)}</select></label><div className="quantity-unit-row"><label>新增數量<input inputMode="numeric" value={stockIn.pieces} onChange={(event) => setStockIn({ ...stockIn, pieces: event.target.value.replace(/\D/g, "") })} /></label><label>輸入單位<select value={stockIn.unitMode} onChange={(event) => setStockIn({ ...stockIn, unitMode: event.target.value as UnitMode })}><option value="package">箱／包</option><option value="base">{items.find((item) => item.id === stockIn.productId)?.unit ?? "件"}</option></select></label></div>{stockIn.productId && <div className="conversion-note">自動換算：<strong>{stockIn.unitMode === "package" ? Number(stockIn.pieces || 0) * (items.find((item) => item.id === stockIn.productId)?.pack_size ?? 0) : Number(stockIn.pieces || 0)}</strong> {items.find((item) => item.id === stockIn.productId)?.unit}</div>}<label>來源<input value={stockIn.source} onChange={(event) => setStockIn({ ...stockIn, source: event.target.value })} /></label><button className="primary-button" onClick={saveInbound} disabled={busy === "inbound"}>{busy === "inbound" ? "儲存中…" : "確認入貨"}</button></div><div className="excel-tool-card inbound-excel"><div><span className="excel-badge">XLSX</span><div><strong>AI 訂單 Excel 入貨</strong><p>外部 AI 按固定欄位生成 Excel；Stockcheck 會自動配對產品再俾你核對。</p></div></div><div className="excel-actions"><button onClick={() => downloadInboundTemplate(workspace.name).catch(() => setToast("未能下載 Excel 範本"))} disabled={excelBusy}>下載格式範例</button><button onClick={() => inboundExcelRef.current?.click()} disabled={excelBusy}>{excelBusy ? "讀取中…" : "Import Excel"}</button><input ref={inboundExcelRef} hidden type="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" onChange={(event) => openInboundExcel(event.target.files?.[0])} /></div></div></section>}
+    {tab === "inbound" && canWrite && <section className="content-section"><div className="section-heading"><div><p className="eyebrow">增加庫存</p><h2>新貨入庫</h2></div>{canAdmin && <button className="outline-button" onClick={() => setShowNewProduct(true)}>＋ 新增產品</button>}</div><div className="form-card"><label>現有產品<select value={stockIn.productId} onChange={(event) => setStockIn({ ...stockIn, productId: event.target.value })}><option value="">請選擇</option>{items.map((item) => <option value={item.id} key={item.id}>{item.category}｜{item.brand}｜{item.flavor}</option>)}</select></label><div className="quantity-unit-row"><label>新增數量<input inputMode="numeric" value={stockIn.pieces} onChange={(event) => setStockIn({ ...stockIn, pieces: event.target.value.replace(/\D/g, "") })} /></label><label>輸入單位<select value={stockIn.unitMode} onChange={(event) => setStockIn({ ...stockIn, unitMode: event.target.value as UnitMode })}><option value="package">箱／包</option><option value="base">{items.find((item) => item.id === stockIn.productId)?.unit ?? "件"}</option></select></label></div>{stockIn.productId && <div className="conversion-note">自動換算：<strong>{stockIn.unitMode === "package" ? Number(stockIn.pieces || 0) * (items.find((item) => item.id === stockIn.productId)?.pack_size ?? 0) : Number(stockIn.pieces || 0)}</strong> {items.find((item) => item.id === stockIn.productId)?.unit}</div>}<label>來源<input value={stockIn.source} onChange={(event) => setStockIn({ ...stockIn, source: event.target.value })} /></label><button className="primary-button" onClick={saveInbound} disabled={busy === "inbound"}>{busy === "inbound" ? "儲存中…" : "確認入貨"}</button></div><div className="excel-tool-card inbound-excel"><div><span className="excel-badge">XLSX</span><div><strong>AI 訂單 Excel 入貨</strong><p>外部 AI 按固定欄位生成 Excel；Stockcheck 會自動配對產品再俾你核對。</p></div></div><div className="excel-actions"><button onClick={() => downloadInboundTemplate(workspace.name).catch(() => setToast("未能下載 Excel 範本"))} disabled={excelBusy}>下載格式範例</button><button onClick={() => inboundExcelRef.current?.click()} disabled={excelBusy}>{excelBusy ? "讀取中…" : "Import Excel"}</button><input ref={inboundExcelRef} hidden type="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" onChange={(event) => openInboundExcel(event.target.files?.[0])} /></div></div></section>}
 
-    {tab === "activity" && <section className="content-section"><div className="section-heading"><div><p className="eyebrow">可追查記錄</p><h2>最近操作</h2></div></div><div className="activity-list">{activity.length ? activity.map((entry) => { const canCorrect = entry.kind === "入貨" && (workspace.role !== "member" || entry.actor_id === session.user.id); return <div className={entry.is_corrected ? "activity-row corrected" : "activity-row"} key={`${entry.kind}-${entry.id}`}><span className={entry.kind === "盤點" ? "activity-icon count" : "activity-icon inbound"}>{entry.kind === "盤點" ? "✓" : "+"}</span><div><strong>{entry.product_name}{entry.is_corrected && <em>已更正</em>}</strong><p>{entry.source} · {entry.actor} · {new Date(entry.happened_at).toLocaleString("zh-HK")}</p>{entry.is_corrected && <small>原本：{entry.original_product_name} +{entry.original_quantity}；由 {entry.corrected_by_email} 更正</small>}</div><aside><b>{entry.kind === "盤點" ? entry.quantity : `+${entry.quantity}`}</b>{canCorrect && <button onClick={() => setCorrectingEntry(entry)}>更正</button>}</aside></div>; }) : <div className="empty">未有操作記錄</div>}</div></section>}
+    {tab === "activity" && <section className="content-section"><div className="section-heading"><div><p className="eyebrow">可追查記錄</p><h2>最近操作</h2></div></div><div className="activity-list">{activity.length ? activity.map((entry) => { const canCorrect = canAdmin && entry.kind === "入貨" && !entry.is_voided; return <div className={`${entry.is_corrected ? "activity-row corrected" : "activity-row"}${entry.is_voided ? " voided" : ""}`} key={`${entry.kind}-${entry.id}`}><span className={entry.kind === "盤點" ? "activity-icon count" : "activity-icon inbound"}>{entry.is_voided ? "×" : entry.kind === "盤點" ? "✓" : "+"}</span><div><strong>{entry.product_name}{entry.is_corrected && <em>已更正</em>}{entry.is_voided && <em>已作廢</em>}</strong><p>{entry.source} · {entry.actor} · {new Date(entry.happened_at).toLocaleString("zh-HK")}</p>{entry.is_corrected && <small>原本：{entry.original_product_name} +{entry.original_quantity}；由 {entry.corrected_by_email} 更正</small>}{entry.is_voided && <small>作廢原因：{entry.void_reason}；由 {entry.voided_by_email} 作廢</small>}</div><aside><b>{entry.kind === "盤點" ? entry.quantity : `+${entry.quantity}`}</b>{canCorrect && <button onClick={() => setCorrectingEntry(entry)}>更正</button>}{canAdmin && !entry.is_voided && <button className="danger-link" onClick={() => setVoidingEntry(entry)}>作廢</button>}</aside></div>; }) : <div className="empty">未有操作記錄</div>}</div></section>}
 
     <div className="ad-safe-gap" aria-label="Google 廣告安全區" />
-    <nav className="bottom-nav">{([["count","盤點","✓"],["stock","庫存","▦"],["inbound","入貨","＋"],["activity","記錄","◷"]] as [Tab,string,string][]).map(([id,label,icon]) => <button key={id} className={tab === id ? "active" : ""} onClick={() => setTab(id)}><span>{icon}</span>{label}</button>)}</nav>
+    <nav className="bottom-nav">{([["count","盤點","✓"],["stock","庫存","▦"],["inbound","入貨","＋"],["activity","記錄","◷"]] as [Tab,string,string][]).filter(([id]) => canWrite || (id !== "count" && id !== "inbound")).map(([id,label,icon]) => <button key={id} className={tab === id ? "active" : ""} onClick={() => setTab(id)}><span>{icon}</span>{label}</button>)}</nav>
     {showNewProduct && <NewProductDialog session={session} workspaceId={workspace.id} items={items} close={() => setShowNewProduct(false)} saved={async () => { setShowNewProduct(false); setToast("新產品已加入共享清單"); await refresh(); }} />}
     {editingProduct && <EditProductDialog item={editingProduct} items={items} close={() => setEditingProduct(null)} saved={async () => { setEditingProduct(null); setToast("產品資料已同步到所有裝置"); await refresh(); }} />}
     {correctingEntry && <CorrectStockInDialog entry={correctingEntry} items={items} workspace={workspace} close={() => setCorrectingEntry(null)} saved={async () => { setCorrectingEntry(null); setToast("入貨記錄及庫存已更正"); await refresh(); }} />}
+    {voidingEntry && <VoidActivityDialog entry={voidingEntry} workspace={workspace} close={() => setVoidingEntry(null)} saved={async (count) => { setVoidingEntry(null); setToast(`${count} 筆記錄已作廢，庫存已重新計算`); await refresh(); }} />}
     {showWorkspace && <WorkspaceDialog session={session} workspace={workspace} workspaces={workspaces} changeWorkspace={changeWorkspace} reload={reloadWorkspaces} close={() => setShowWorkspace(false)} />}
     {showCategoryManager && <CategoryManager items={items} workspace={workspace} close={() => setShowCategoryManager(false)} saved={async (count, source, target) => { setToast(`${count} 款產品已搬到「${target} → ${source}」`); await refresh(); }} />}
     {pdf && <UploadReview pdf={pdf} items={items} setPdf={setPdf} confirm={confirmPdf} busy={busy === "pdf"} />}
@@ -825,28 +836,73 @@ function NewProductDialog({ session, workspaceId, items, close, saved }: { sessi
   return <div className="modal-backdrop"><section className="modal"><div className="modal-head"><div><p className="eyebrow">共享產品目錄</p><h2>新增產品</h2></div><button onClick={close}>取消</button></div><div className="modal-form"><ExpandedChoicePicker label="主分類" options={categories} value={form.category} onChange={(category) => setForm({ ...form, category, subcategory: items.find((product) => product.category === category)?.subcategory ?? "" })} /><ExpandedChoicePicker label="子分類" options={subcategories} value={form.subcategory} onChange={(subcategory) => change("subcategory", subcategory)} /><div className="two-fields"><label>品牌<input value={form.brand} onChange={(e) => change("brand", e.target.value)} /></label><label>味道<input value={form.flavor} onChange={(e) => change("flavor", e.target.value)} /></label></div><label>產品名稱<input value={form.name} onChange={(e) => change("name", e.target.value)} /></label><div className="two-fields"><label>規格<input value={form.spec} onChange={(e) => change("spec", e.target.value)} placeholder="例如 25g x 30" /></label><label>盤點單位<input value={form.unit} onChange={(e) => change("unit", e.target.value)} placeholder="小包" /></label></div><div className="three-fields"><label>每箱／包件數<input inputMode="numeric" value={form.packSize} onChange={(e) => change("packSize", e.target.value.replace(/\D/g, ""))} /></label><label>首次箱／包數<input inputMode="numeric" value={form.initialPieces} onChange={(e) => change("initialPieces", e.target.value.replace(/\D/g, ""))} /></label><label>低存量警示<input inputMode="numeric" value={form.lowStockLevel} onChange={(e) => change("lowStockLevel", e.target.value.replace(/\D/g, ""))} /></label></div>{error && <p className="form-message error">{error}</p>}<button className="primary-button" onClick={save} disabled={busy}>{busy ? "儲存中…" : "建立並加入首次入貨"}</button></div></section></div>;
 }
 
+function VoidActivityDialog({ entry, workspace, close, saved }: { entry: Activity; workspace: Workspace; close: () => void; saved: (count: number) => Promise<void> }) {
+  const [reason, setReason] = useState("");
+  const [wholeBatch, setWholeBatch] = useState(Boolean(entry.order_number));
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const confirm = async () => {
+    if (reason.trim().length < 2) return setError("請輸入作廢原因");
+    setBusy(true); setError("");
+    const { data, error: voidError } = await supabase.rpc("void_activity_record", { target_workspace: workspace.id, target_kind: entry.kind, target_id: entry.id, target_reason: reason.trim(), target_batch: wholeBatch });
+    setBusy(false);
+    if (voidError || !data) return setError("未能作廢記錄，請確認你有管理員權限");
+    await saved(Number(data));
+  };
+  return <div className="modal-backdrop"><section className="modal danger-modal"><div className="modal-head"><div><p className="eyebrow">保留追查資料</p><h2>作廢整筆記錄</h2></div><button onClick={close}>取消</button></div><div className="original-entry"><span>{entry.kind}記錄</span><strong>{entry.product_name} · {entry.kind === "入貨" ? "+" : ""}{entry.quantity}</strong><small>{entry.actor} · {new Date(entry.happened_at).toLocaleString("zh-HK")}</small></div>{entry.order_number && <label className="batch-choice"><input type="checkbox" checked={wholeBatch} onChange={(event) => setWholeBatch(event.target.checked)} /><span><strong>作廢整張訂單</strong><small>訂單 {entry.order_number} 內所有產品會一併取消入貨。</small></span></label>}<div className="modal-form"><label>作廢原因<input autoFocus value={reason} onChange={(event) => setReason(event.target.value)} placeholder="例如：重複入貨、輸入錯誤" /></label><div className="status-note">作廢後不會計入庫存，但原記錄及原因仍會保留。</div>{error && <p className="form-message error">{error}</p>}<button className="danger-button" onClick={confirm} disabled={busy}>{busy ? "處理中…" : wholeBatch && entry.order_number ? "確認作廢整張訂單" : "確認作廢記錄"}</button></div></section></div>;
+}
+
 function WorkspaceDialog({ session, workspace, workspaces, changeWorkspace, reload, close }: { session: Session; workspace: Workspace; workspaces: Workspace[]; changeWorkspace: (id: string) => void; reload: () => Promise<void>; close: () => void }) {
   const [members, setMembers] = useState<WorkspaceMember[]>([]);
   const [inviteEmail, setInviteEmail] = useState("");
+  const [inviteRole, setInviteRole] = useState<Exclude<WorkspaceRole, "owner">>("member");
+  const [storeName, setStoreName] = useState(workspace.name);
   const [newName, setNewName] = useState("");
   const [message, setMessage] = useState("");
   const [busy, setBusy] = useState(false);
   const canManage = workspace.role === "owner" || workspace.role === "admin";
+  const canRename = workspace.role === "owner";
 
   const loadMembers = async () => {
     const { data } = await supabase.from("workspace_members").select("user_id,email,role").eq("workspace_id", workspace.id).order("joined_at");
     setMembers((data ?? []) as WorkspaceMember[]);
   };
-  useEffect(() => { loadMembers(); }, [workspace.id]);
+  useEffect(() => { setStoreName(workspace.name); setMessage(""); if (workspace.role !== "owner" && inviteRole === "admin") setInviteRole("member"); loadMembers(); }, [workspace.id, workspace.name, workspace.role]);
 
   const invite = async () => {
     const email = inviteEmail.trim().toLowerCase();
     if (!email.includes("@")) return setMessage("請輸入正確電郵地址");
     setBusy(true);
-    const { error } = await supabase.from("workspace_invites").insert({ workspace_id: workspace.id, email, role: "member", invited_by: session.user.id });
+    const { error } = await supabase.from("workspace_invites").insert({ workspace_id: workspace.id, email, role: inviteRole, invited_by: session.user.id });
     setBusy(false);
     if (error) return setMessage(error.code === "23505" ? "呢個電郵已經邀請過" : "未能建立邀請");
-    setInviteEmail(""); setMessage("邀請已建立。請叫對方用呢個電郵登入 Stockcheck，系統會自動加入。 ");
+    setInviteEmail(""); setMessage(`邀請已建立，對方登入後會成為「${roleLabel(inviteRole)}」。`);
+  };
+
+  const rename = async () => {
+    if (!storeName.trim()) return setMessage("請輸入店舖名稱");
+    setBusy(true);
+    const { error } = await supabase.rpc("rename_workspace", { target_workspace: workspace.id, new_name: storeName.trim() });
+    setBusy(false);
+    if (error) return setMessage("未能修改店舖名稱");
+    await reload(); setMessage("店舖名稱已同步到所有裝置");
+  };
+
+  const changeRole = async (member: WorkspaceMember, role: Exclude<WorkspaceRole, "owner">) => {
+    setBusy(true); setMessage("");
+    const { error } = await supabase.rpc("update_workspace_member_role", { target_workspace: workspace.id, target_user: member.user_id, new_role: role });
+    setBusy(false);
+    if (error) return setMessage("未能修改權限；只有擁有人可以管理其他管理員");
+    await loadMembers(); setMessage(`${member.email} 已改為「${roleLabel(role)}」`);
+  };
+
+  const removeMember = async (member: WorkspaceMember) => {
+    if (!window.confirm(`確定移除 ${member.email}？對方會立即失去呢間店嘅存取權。`)) return;
+    setBusy(true); setMessage("");
+    const { error } = await supabase.rpc("remove_workspace_member", { target_workspace: workspace.id, target_user: member.user_id });
+    setBusy(false);
+    if (error) return setMessage("未能移除成員；只有擁有人可以移除管理員");
+    await loadMembers(); setMessage(`${member.email} 已移除`);
   };
 
   const createAnother = async () => {
@@ -858,7 +914,7 @@ function WorkspaceDialog({ session, workspace, workspaces, changeWorkspace, relo
     setNewName(""); await reload(); changeWorkspace(data as string); setMessage("新店舖已建立");
   };
 
-  return <div className="modal-backdrop"><section className="modal workspace-modal"><div className="modal-head"><div><p className="eyebrow">Workspace</p><h2>店舖及成員</h2></div><button onClick={close}>完成</button></div><label className="workspace-picker">切換店舖<select value={workspace.id} onChange={(event) => changeWorkspace(event.target.value)}>{workspaces.map((item) => <option value={item.id} key={item.id}>{item.name}</option>)}</select></label><section className="member-panel"><div className="panel-title"><strong>{workspace.name}</strong><span>{workspace.role === "owner" ? "擁有人" : workspace.role === "admin" ? "管理員" : "成員"}</span></div>{members.map((member) => <div className="member-row" key={member.user_id}><span>{member.email}</span><b>{member.role === "owner" ? "擁有人" : member.role === "admin" ? "管理員" : "成員"}</b></div>)}</section>{canManage && <section className="workspace-form"><p className="eyebrow">邀請同事</p><div><input type="email" inputMode="email" value={inviteEmail} onChange={(event) => setInviteEmail(event.target.value)} placeholder="同事電郵" /><button onClick={invite} disabled={busy}>邀請</button></div><small>對方用相同電郵登入後，會自動加入呢間店。</small></section>}<section className="workspace-form"><p className="eyebrow">另一間獨立店舖</p><div><input value={newName} onChange={(event) => setNewName(event.target.value)} placeholder="新店舖／倉庫名稱" /><button onClick={createAnother} disabled={busy}>建立</button></div></section>{message && <p className="form-message">{message}</p>}<button className="logout-button" onClick={() => supabase.auth.signOut()}>登出 {session.user.email}</button></section></div>;
+  return <div className="modal-backdrop"><section className="modal workspace-modal"><div className="modal-head"><div><p className="eyebrow">Workspace</p><h2>店舖及成員</h2></div><button onClick={close}>完成</button></div><label className="workspace-picker">切換店舖<select value={workspace.id} onChange={(event) => changeWorkspace(event.target.value)}>{workspaces.map((item) => <option value={item.id} key={item.id}>{item.name}</option>)}</select></label>{canRename && <section className="workspace-form"><p className="eyebrow">店舖名稱</p><div><input value={storeName} onChange={(event) => setStoreName(event.target.value)} maxLength={80} /><button onClick={rename} disabled={busy || storeName.trim() === workspace.name}>儲存</button></div><small>只有擁有人可以改名；庫存及記錄不受影響。</small></section>}<section className="member-panel permission-panel"><div className="panel-title"><strong>{workspace.name}</strong><span>{roleLabel(workspace.role)}</span></div>{members.map((member) => { const locked = member.role === "owner" || (workspace.role === "admin" && member.role === "admin"); return <div className="member-row" key={member.user_id}><span>{member.email}{member.user_id === session.user.id && <small>你</small>}</span>{canManage && !locked ? <div className="member-actions"><select value={member.role} onChange={(event) => changeRole(member, event.target.value as Exclude<WorkspaceRole, "owner">)} disabled={busy}><option value="member">一般成員</option><option value="viewer">只供查看</option>{workspace.role === "owner" && <option value="admin">管理員</option>}</select><button onClick={() => removeMember(member)} disabled={busy}>移除</button></div> : <b>{roleLabel(member.role)}</b>}</div>; })}</section>{canManage && <section className="workspace-form invite-form"><p className="eyebrow">邀請同事</p><div><input type="email" inputMode="email" value={inviteEmail} onChange={(event) => setInviteEmail(event.target.value)} placeholder="同事電郵" /><select value={inviteRole} onChange={(event) => setInviteRole(event.target.value as Exclude<WorkspaceRole, "owner">)}><option value="member">一般成員</option><option value="viewer">只供查看</option>{workspace.role === "owner" && <option value="admin">管理員</option>}</select><button onClick={invite} disabled={busy}>邀請</button></div><small>一般成員可盤點及入貨；只供查看不可修改資料。</small></section>}<section className="workspace-form"><p className="eyebrow">另一間獨立店舖</p><div><input value={newName} onChange={(event) => setNewName(event.target.value)} placeholder="新店舖／倉庫名稱" /><button onClick={createAnother} disabled={busy}>建立</button></div></section>{message && <p className="form-message">{message}</p>}<button className="logout-button" onClick={() => supabase.auth.signOut()}>登出 {session.user.email}</button></section></div>;
 }
 
 function ExcelReviewPage({ review, items, setReview, confirmInbound, confirmStocktake, busy }: { review: ExcelReview; items: InventoryItem[]; setReview: (review: ExcelReview | null) => void; confirmInbound: () => void; confirmStocktake: () => void; busy: boolean }) {

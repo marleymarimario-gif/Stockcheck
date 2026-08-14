@@ -11,6 +11,8 @@
 - 每間店舖／倉庫是獨立 Workspace，只有成員可以查看。
 - 店主可在「管理店舖」輸入同事電郵；對方用相同電郵登入後會自動加入。
 - 同一帳戶可建立及切換多間店舖，各自保留獨立產品、庫存和記錄。
+- 店舖擁有人可改店名；管理頁可將參與人設定為管理員、一般成員或只供查看，並可安全移除成員。
+- 擁有人及管理員可將錯誤盤點、單筆入貨或整張 Excel 訂單標記為作廢；作廢資料不再計入庫存，但會保留原因及操作人以供追查。
 - 記錄頁可更正入錯的產品、數量及單位，並保留原資料與更正人；庫存頁可編輯產品名稱、主分類、子分類及包裝資料。
 - 管理員可在「庫存 → 分類設定」查看兩層分類，並將原有主分類批量搬入現有或新建主分類之下；產品、庫存及歷史記錄不受影響。
 - 「入貨」可下載固定格式 Excel 交由外部 AI 填寫，再匯入核對、配對現有產品或建立陌生產品；「盤點」可匯出當日清單再批量匯入，並提示多人更新衝突。
@@ -23,6 +25,6 @@
 - `VITE_SUPABASE_ANON_KEY`
 - `VITE_ADSENSE_PUBLISHER_ID`（完成 AdSense 審批後填寫）
 
-資料庫基礎結構在 `supabase/schema.sql`，Workspace 升級及 RLS 資料隔離在 `supabase/workspace-migration.sql`；現有系統的兩層分類升級在 `supabase/subcategory-migration.sql`，安全批量分類搬移在 `supabase/category-manager-migration.sql`，Excel 操作來源及訂單防重複更新在 `supabase/excel-import-migration.sql`。使用者以電郵 Magic Link 登入，新使用者可建立自己的獨立店舖。
+資料庫基礎結構在 `supabase/schema.sql`，Workspace 升級及 RLS 資料隔離在 `supabase/workspace-migration.sql`；現有系統的兩層分類升級在 `supabase/subcategory-migration.sql`，安全批量分類搬移在 `supabase/category-manager-migration.sql`，Excel 操作來源及訂單防重複更新在 `supabase/excel-import-migration.sql`，店舖權限、改名及記錄作廢在 `supabase/permissions-and-void-migration.sql`。使用者以電郵 Magic Link 登入，新使用者可建立自己的獨立店舖。
 
 Google AdSense 使用官方底部 regular anchor 格式。未設定有效 `ca-pub-…` 或尚未通過 Google 審批時，不會顯示廣告。
