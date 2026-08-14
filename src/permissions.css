@@ -15,6 +15,18 @@
 .batch-choice input { margin-top: 3px; accent-color: #ef6d71; }
 .batch-choice span { display: grid; gap: 4px; }
 .batch-choice small { color: #b68d90; font-size: .67rem; line-height: 1.4; }
+.validation-banner { border: 1px solid #8c454c; border-radius: 12px; background: #351e23; color: #ffc1c2; padding: 12px; margin-top: 13px; }
+.validation-banner strong { color: #ffb4b7; }
+.validation-banner ul { display: grid; gap: 5px; margin: 8px 0 0 18px; padding: 0; font-size: .7rem; line-height: 1.4; }
+.validation-ready { border: 1px solid #28614f; border-radius: 12px; background: #102d26; color: #73dfbd; padding: 11px; margin-top: 13px; font-size: .74rem; }
+.field-label-invalid { color: #ff9fa4 !important; }
+.field-label-invalid small { color: #ff9fa4 !important; margin-top: 0 !important; }
+.field-invalid { border-color: #d85e65 !important; background: #2d171c !important; box-shadow: 0 0 0 1px #d85e6544; }
+.review-item.has-error { margin: 6px -7px; padding: 14px 7px; border: 1px solid #763d43; border-radius: 13px; background: #21171b; }
+.generated-product.has-error { border-color: #8d454c; background: #2a1c20; }
+.generated-product.has-error .generated-product-title b { background: #54282e; color: #ffb2b5; }
+.generated-product.is-ready .generated-product-title b { background: #173e35; color: #8ae7cc; }
+.line-validation { display: grid; gap: 4px; border-left: 3px solid #d85e65; color: #ffafb2; padding: 7px 9px; margin-top: 9px; font-size: .68rem; }
 
 @media (max-width: 520px) {
   .member-row { align-items: flex-start; }

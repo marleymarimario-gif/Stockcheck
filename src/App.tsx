@@ -42,7 +42,7 @@ type ExcelReview =
 
 const today = () => new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Hong_Kong" });
 const publisherId = import.meta.env.VITE_ADSENSE_PUBLISHER_ID ?? "";
-const appVersion = "2026.08.14.16";
+const appVersion = "2026.08.14.17";
 const roleLabel = (role: WorkspaceRole) => role === "owner" ? "擁有人" : role === "admin" ? "管理員" : role === "viewer" ? "只供查看" : "一般成員";
 
 function useLatestAppVersion() {
@@ -546,12 +546,11 @@ function Stockcheck({ session, workspace, workspaces, changeWorkspace, reloadWor
 
   const confirmInboundExcel = async (review: Extract<ExcelReview, { kind: "inbound" }>) => {
     const orderNumber = review.orderNumber.trim();
-    if (!orderNumber) return setToast("請填寫訂單編號");
     const duplicateIds = review.lines.map((line, index) => line.productId || (line.draft ? productIdentity(line.draft) : `missing:${index}`));
     if (new Set(duplicateIds).size !== duplicateIds.length) return setToast("Excel 有重複產品，請刪除或合併後再確認");
     setBusy("excel-inbound");
     const existingIds = review.lines.map((line) => line.productId).filter(Boolean);
-    if (existingIds.length) {
+    if (orderNumber && existingIds.length) {
       const { data: duplicates, error: duplicateError } = await supabase.from("stock_ins").select("product_id").eq("workspace_id", workspace.id).eq("order_number", orderNumber).in("product_id", existingIds);
       if (duplicateError || duplicates?.length) { setBusy(null); return setToast(duplicates?.length ? "呢張訂單已有產品入過貨，已停止重複入貨" : "未能檢查重複訂單"); }
     }
@@ -566,7 +565,7 @@ function Stockcheck({ session, workspace, workspaces, changeWorkspace, reloadWor
     const rows = review.lines.map((line, index) => {
       const item = line.draft ?? items.find((candidate) => candidate.id === line.productId)!;
       const enteredQuantity = Number(line.quantity); const unitsAdded = line.unitMode === "package" ? enteredQuantity * item.pack_size : enteredQuantity;
-      return { workspace_id: workspace.id, product_id: line.draft ? createdIds.get(index)! : line.productId, pieces: line.unitMode === "package" ? enteredQuantity : 1, units_added: unitsAdded, entered_quantity: enteredQuantity, entered_unit: line.unitMode === "package" ? "箱／包" : item.unit, source: `Excel 入貨: ${review.filename}`, order_number: orderNumber, added_by: session.user.id, added_by_email: session.user.email };
+      return { workspace_id: workspace.id, product_id: line.draft ? createdIds.get(index)! : line.productId, pieces: line.unitMode === "package" ? enteredQuantity : 1, units_added: unitsAdded, entered_quantity: enteredQuantity, entered_unit: line.unitMode === "package" ? "箱／包" : item.unit, source: `Excel 入貨: ${review.filename}`, order_number: orderNumber || null, added_by: session.user.id, added_by_email: session.user.email };
     });
     const { error } = await supabase.from("stock_ins").insert(rows);
     setBusy(null);
@@ -917,6 +916,69 @@ function WorkspaceDialog({ session, workspace, workspaces, changeWorkspace, relo
   return <div className="modal-backdrop"><section className="modal workspace-modal"><div className="modal-head"><div><p className="eyebrow">Workspace</p><h2>店舖及成員</h2></div><button onClick={close}>完成</button></div><label className="workspace-picker">切換店舖<select value={workspace.id} onChange={(event) => changeWorkspace(event.target.value)}>{workspaces.map((item) => <option value={item.id} key={item.id}>{item.name}</option>)}</select></label>{canRename && <section className="workspace-form"><p className="eyebrow">店舖名稱</p><div><input value={storeName} onChange={(event) => setStoreName(event.target.value)} maxLength={80} /><button onClick={rename} disabled={busy || storeName.trim() === workspace.name}>儲存</button></div><small>只有擁有人可以改名；庫存及記錄不受影響。</small></section>}<section className="member-panel permission-panel"><div className="panel-title"><strong>{workspace.name}</strong><span>{roleLabel(workspace.role)}</span></div>{members.map((member) => { const locked = member.role === "owner" || (workspace.role === "admin" && member.role === "admin"); return <div className="member-row" key={member.user_id}><span>{member.email}{member.user_id === session.user.id && <small>你</small>}</span>{canManage && !locked ? <div className="member-actions"><select value={member.role} onChange={(event) => changeRole(member, event.target.value as Exclude<WorkspaceRole, "owner">)} disabled={busy}><option value="member">一般成員</option><option value="viewer">只供查看</option>{workspace.role === "owner" && <option value="admin">管理員</option>}</select><button onClick={() => removeMember(member)} disabled={busy}>移除</button></div> : <b>{roleLabel(member.role)}</b>}</div>; })}</section>{canManage && <section className="workspace-form invite-form"><p className="eyebrow">邀請同事</p><div><input type="email" inputMode="email" value={inviteEmail} onChange={(event) => setInviteEmail(event.target.value)} placeholder="同事電郵" /><select value={inviteRole} onChange={(event) => setInviteRole(event.target.value as Exclude<WorkspaceRole, "owner">)}><option value="member">一般成員</option><option value="viewer">只供查看</option>{workspace.role === "owner" && <option value="admin">管理員</option>}</select><button onClick={invite} disabled={busy}>邀請</button></div><small>一般成員可盤點及入貨；只供查看不可修改資料。</small></section>}<section className="workspace-form"><p className="eyebrow">另一間獨立店舖</p><div><input value={newName} onChange={(event) => setNewName(event.target.value)} placeholder="新店舖／倉庫名稱" /><button onClick={createAnother} disabled={busy}>建立</button></div></section>{message && <p className="form-message">{message}</p>}<button className="logout-button" onClick={() => supabase.auth.signOut()}>登出 {session.user.email}</button></section></div>;
 }
 
+function InboundExcelReviewPage({ review, items, setReview, confirmInbound, busy }: { review: Extract<ExcelReview, { kind: "inbound" }>; items: InventoryItem[]; setReview: (review: ExcelReview | null) => void; confirmInbound: () => void; busy: boolean }) {
+  const update = (index: number, next: Partial<ExcelInboundLine>) => {
+    const lines = [...review.lines]; lines[index] = { ...lines[index], ...next }; setReview({ ...review, lines });
+  };
+  const lineIssues = (line: ExcelInboundLine) => {
+    const issues: string[] = [];
+    if (!Number.isInteger(Number(line.quantity)) || Number(line.quantity) <= 0) issues.push("實收數量必須大過 0");
+    if (!line.draft && !line.productId) issues.push("未選擇產品");
+    if (line.draft) {
+      const required: [keyof ProductDraft, string][] = [["category", "主分類"], ["subcategory", "子分類"], ["brand", "品牌"], ["flavor", "味道"], ["name", "產品名稱"], ["unit", "基本單位"]];
+      const missing = required.filter(([key]) => !String(line.draft?.[key] ?? "").trim()).map(([, label]) => label);
+      if (missing.length) issues.push(`未填：${missing.join("、")}`);
+      if (!Number.isInteger(Number(line.draft.pack_size)) || line.draft.pack_size < 1) issues.push("每箱／包數量必須最少為 1");
+    }
+    return issues;
+  };
+  const identities = review.lines.map((line, index) => line.productId || (line.draft ? productIdentity(line.draft) : `missing:${index}`));
+  const duplicate = new Set(identities).size !== identities.length;
+  const problems = [
+    ...(!review.lines.length ? ["Excel 入面未有可入貨項目"] : []),
+    ...(duplicate ? ["有重複產品，請刪除重複項目或先合併數量"] : []),
+    ...review.lines.flatMap((line, index) => lineIssues(line).map((issue) => `第 ${index + 1} 項：${issue}`)),
+  ];
+  const totalUnits = review.lines.reduce((total, line) => {
+    const item = line.draft ?? items.find((candidate) => candidate.id === line.productId);
+    return total + Number(line.quantity || 0) * (line.unitMode === "package" ? item?.pack_size ?? 0 : 1);
+  }, 0);
+  const invalidField = (value: unknown) => !String(value ?? "").trim() ? "field-invalid" : "";
+
+  return <div className="review-page excel-review-page">
+    <header className="review-topbar"><button onClick={() => setReview(null)}>← 取消</button><div><p className="eyebrow">未更新庫存</p><h2>Excel 入貨核對</h2></div><span>{review.lines.length} 項</span></header>
+    <section className="review-summary">
+      <div><span>上載檔案</span><strong>{review.filename}</strong></div>
+      <label>訂單編號（選填）<input value={review.orderNumber} onChange={(event) => setReview({ ...review, orderNumber: event.target.value })} placeholder="留空亦可入貨" /><small>{review.orderNumber.trim() ? "已啟用同一訂單防重複檢查" : "如有填寫，系統會防止同一訂單重複入貨"}</small></label>
+      <div className="review-totals"><span>入貨項目 <b>{review.lines.length}</b></span><span>預計新增 <b>{totalUnits}</b> 件</span></div>
+      {problems.length > 0 && <div className="validation-banner"><strong>仲有 {problems.length} 項資料未完成</strong><ul>{problems.map((problem, index) => <li key={`${problem}-${index}`}>{problem}</li>)}</ul></div>}
+      {!problems.length && <div className="validation-ready"><strong>✓ 資料齊全，可以確認入貨</strong></div>}
+    </section>
+    <section className="review-list"><div className="review-heading"><div><p className="eyebrow">自動配對結果</p><h3>產品及實收數量</h3></div></div>
+      {review.lines.map((line, index) => {
+        const item = line.draft ?? items.find((candidate) => candidate.id === line.productId);
+        const issues = lineIssues(line);
+        const updateDraft = (key: keyof ProductDraft, value: string | number) => line.draft && update(index, { draft: { ...line.draft, [key]: value } });
+        return <article className={issues.length ? "review-item has-error" : "review-item is-ready"} key={`${line.rowNumber}-${index}`}>
+          <div className="review-item-number">{index + 1}</div><div className="review-fields">
+            {line.draft ? <div className={issues.length ? "generated-product has-error" : "generated-product is-ready"}>
+              <div className="generated-product-title"><span>建立新產品</span><b>{issues.length ? `尚欠 ${issues.length} 項` : "資料齊全"}</b></div>
+              <div className="two-fields"><label>主分類<input className={invalidField(line.draft.category)} value={line.draft.category} onChange={(event) => updateDraft("category", event.target.value)} /></label><label>子分類<input className={invalidField(line.draft.subcategory)} value={line.draft.subcategory} onChange={(event) => updateDraft("subcategory", event.target.value)} /></label></div>
+              <div className="two-fields"><label>品牌<input className={invalidField(line.draft.brand)} value={line.draft.brand} onChange={(event) => updateDraft("brand", event.target.value)} /></label><label>味道<input className={invalidField(line.draft.flavor)} value={line.draft.flavor} onChange={(event) => updateDraft("flavor", event.target.value)} /></label></div>
+              <label>產品名稱<input className={invalidField(line.draft.name)} value={line.draft.name} onChange={(event) => updateDraft("name", event.target.value)} /></label>
+              <div className="three-fields"><label>規格<input value={line.draft.spec} onChange={(event) => updateDraft("spec", event.target.value)} /></label><label>基本單位<input className={invalidField(line.draft.unit)} value={line.draft.unit} onChange={(event) => updateDraft("unit", event.target.value)} /></label><label>每箱／包數量<input className={line.draft.pack_size < 1 ? "field-invalid" : ""} inputMode="numeric" value={line.draft.pack_size} onChange={(event) => updateDraft("pack_size", Number(event.target.value.replace(/\D/g, "")))} /></label></div>
+              <button className="mapping-switch" onClick={() => update(index, { draft: undefined, productId: items[0]?.id ?? "", confidence: "suggested" })} disabled={!items.length}>改為配對現有產品</button>
+            </div> : <div className="matched-product"><div><span className={line.confidence === "matched" ? "match-badge" : "match-badge suggested"}>{line.confidence === "matched" ? "已配對" : "可能配對 · 請核對"}</span><button onClick={() => update(index, { draft: { ...line.original }, productId: "", confidence: "new" })}>改為新產品</button></div><label>現有產品<select className={!line.productId ? "field-invalid" : ""} value={line.productId} onChange={(event) => update(index, { productId: event.target.value, confidence: "matched" })}>{items.map((product) => <option key={product.id} value={product.id}>{product.category}｜{product.subcategory}｜{product.brand}｜{product.flavor}｜{product.spec}</option>)}</select></label></div>}
+            <div className="review-quantity"><label>實收數量<input className={!Number.isInteger(Number(line.quantity)) || Number(line.quantity) <= 0 ? "field-invalid" : ""} inputMode="numeric" value={line.quantity} onChange={(event) => { const value = event.target.value.replace(/\D/g, ""); update(index, { quantity: value === "" ? "" : Number(value) }); }} /></label><label>輸入單位<select value={line.unitMode} onChange={(event) => update(index, { unitMode: event.target.value as UnitMode })}><option value="package">箱／包</option><option value="base">{item?.unit ?? "件"}</option></select></label><div><span>自動換算</span><strong>{Number(line.quantity || 0) * (line.unitMode === "package" ? item?.pack_size ?? 0 : 1)} {item?.unit}</strong></div></div>
+            {issues.length > 0 && <div className="line-validation">{issues.map((issue) => <span key={issue}>! {issue}</span>)}</div>}
+          </div><button className="remove-button" onClick={() => setReview({ ...review, lines: review.lines.filter((_line, lineIndex) => lineIndex !== index) })}>×</button>
+        </article>;
+      })}
+    </section>
+    <footer className="review-footer"><div><span>{problems.length ? "請完成紅色提示項目" : "確認後先建立新產品，再批量入貨"}</span><strong>{problems.length ? `尚欠 ${problems.length} 項資料` : `${review.lines.length} 項 · ${totalUnits} 件`}</strong></div><button className="primary-button" onClick={confirmInbound} disabled={busy || problems.length > 0}>{busy ? "同步中…" : problems.length ? `未完成（${problems.length}）` : "確認全部入貨"}</button></footer>
+  </div>;
+}
+
 function ExcelReviewPage({ review, items, setReview, confirmInbound, confirmStocktake, busy }: { review: ExcelReview; items: InventoryItem[]; setReview: (review: ExcelReview | null) => void; confirmInbound: () => void; confirmStocktake: () => void; busy: boolean }) {
   if (review.kind === "stocktake") {
     const update = (index: number, next: Partial<ExcelStocktakeLine>) => { const lines = [...review.lines]; lines[index] = { ...lines[index], ...next }; setReview({ ...review, lines }); };
@@ -926,11 +988,16 @@ function ExcelReviewPage({ review, items, setReview, confirmInbound, confirmStoc
     return <div className="review-page excel-review-page"><header className="review-topbar"><button onClick={() => setReview(null)}>← 取消</button><div><p className="eyebrow">未更新庫存</p><h2>Excel 盤點核對</h2></div><span>{review.lines.length} 項</span></header><section className="review-summary"><div><span>上載檔案</span><strong>{review.filename}</strong></div>{review.exportedAt && <small>匯出時間：{new Date(review.exportedAt).toLocaleString("zh-HK")}</small>}<div className="review-totals"><span>盤點項目 <b>{review.lines.length}</b></span><span className={conflicts ? "conflict-text" : ""}>資料衝突 <b>{conflicts}</b></span></div>{conflicts > 0 && <div className="conflict-banner"><strong>其他人喺匯出後更新過庫存</strong><p>逐項核對最新數量，再接受最新資料繼續。</p><button onClick={acceptLatest}>接受最新庫存資料</button></div>}</section><section className="review-list"><div className="review-heading"><div><p className="eyebrow">逐項確認</p><h3>實際盤點數量</h3></div></div>{review.lines.map((line, index) => { const item = items.find((candidate) => candidate.id === line.productId); return <article className={line.conflictQty === undefined ? "excel-review-row" : "excel-review-row has-conflict"} key={line.productId}><div className="review-item-number">{index + 1}</div><div><strong>{item?.brand} · {item?.flavor}</strong><p>{item?.name}｜{item?.spec}</p><div className="stocktake-compare"><span>匯出時 <b>{line.expectedQty}</b></span>{line.conflictQty !== undefined && <span className="conflict-text">而家 <b>{line.conflictQty}</b></span>}<label>盤點數量<input inputMode="numeric" value={line.quantity} onChange={(event) => { const value = event.target.value.replace(/\D/g, ""); update(index, { quantity: value === "" ? "" : Number(value) }); }} /></label></div></div><button className="remove-button" onClick={() => setReview({ ...review, lines: review.lines.filter((_line, lineIndex) => lineIndex !== index) })}>×</button></article>; })}</section><footer className="review-footer"><div><span>確認後記錄為今日 Stock Take</span><strong>{review.lines.length} 款產品</strong></div><button className="primary-button" onClick={confirmStocktake} disabled={busy || invalid || conflicts > 0}>{busy ? "同步中…" : conflicts ? "請先處理衝突" : "確認全部盤點"}</button></footer></div>;
   }
 
+  return <InboundExcelReviewPage review={review} items={items} setReview={setReview} confirmInbound={confirmInbound} busy={busy} />;
+  /* Legacy inbound review retained temporarily for rollback reference.
+  if (review.kind !== "inbound") return null;
+
   const update = (index: number, next: Partial<ExcelInboundLine>) => { const lines = [...review.lines]; lines[index] = { ...lines[index], ...next }; setReview({ ...review, lines }); };
   const invalid = !review.orderNumber.trim() || !review.lines.length || review.lines.some((line) => !Number.isInteger(Number(line.quantity)) || Number(line.quantity) <= 0 || (!line.draft && !line.productId) || (line.draft && (![line.draft.category, line.draft.subcategory, line.draft.brand, line.draft.flavor, line.draft.name, line.draft.unit].every((value) => value.trim()) || line.draft.pack_size < 1)));
   const identities = review.lines.map((line, index) => line.productId || (line.draft ? productIdentity(line.draft) : `missing:${index}`)); const duplicate = new Set(identities).size !== identities.length;
   const totalUnits = review.lines.reduce((total, line) => { const item = line.draft ?? items.find((candidate) => candidate.id === line.productId); return total + Number(line.quantity || 0) * (line.unitMode === "package" ? item?.pack_size ?? 0 : 1); }, 0);
       return <div className="review-page excel-review-page"><header className="review-topbar"><button onClick={() => setReview(null)}>← 取消</button><div><p className="eyebrow">未更新庫存</p><h2>Excel 入貨核對</h2></div><span>{review.lines.length} 項</span></header><section className="review-summary"><div><span>上載檔案</span><strong>{review.filename}</strong></div><label>訂單編號<input value={review.orderNumber} onChange={(event) => setReview({ ...review, orderNumber: event.target.value })} placeholder="必須填寫，用作防止重複入貨" /></label><div className="review-totals"><span>入貨項目 <b>{review.lines.length}</b></span><span>預計新增 <b>{totalUnits}</b> 件</span></div>{duplicate && <div className="conflict-banner"><strong>Excel 有重複產品</strong><p>請刪除重複項目，或者取消後合併數量再匯入。</p></div>}</section><section className="review-list"><div className="review-heading"><div><p className="eyebrow">自動配對結果</p><h3>產品及實收數量</h3></div></div>{review.lines.map((line, index) => { const item = line.draft ?? items.find((candidate) => candidate.id === line.productId); const updateDraft = (key: keyof ProductDraft, value: string | number) => line.draft && update(index, { draft: { ...line.draft, [key]: value } }); return <article className="review-item" key={`${line.rowNumber}-${index}`}><div className="review-item-number">{index + 1}</div><div className="review-fields">{line.draft ? <div className="generated-product"><div className="generated-product-title"><span>建立新產品</span><b>請核對</b></div><div className="two-fields"><label>主分類<input value={line.draft.category} onChange={(event) => updateDraft("category", event.target.value)} /></label><label>子分類<input value={line.draft.subcategory} onChange={(event) => updateDraft("subcategory", event.target.value)} /></label></div><div className="two-fields"><label>品牌<input value={line.draft.brand} onChange={(event) => updateDraft("brand", event.target.value)} /></label><label>味道<input value={line.draft.flavor} onChange={(event) => updateDraft("flavor", event.target.value)} /></label></div><label>產品名稱<input value={line.draft.name} onChange={(event) => updateDraft("name", event.target.value)} /></label><div className="three-fields"><label>規格<input value={line.draft.spec} onChange={(event) => updateDraft("spec", event.target.value)} /></label><label>基本單位<input value={line.draft.unit} onChange={(event) => updateDraft("unit", event.target.value)} /></label><label>每箱／包數量<input inputMode="numeric" value={line.draft.pack_size} onChange={(event) => updateDraft("pack_size", Math.max(1, Number(event.target.value.replace(/\D/g, ""))))} /></label></div><button className="mapping-switch" onClick={() => update(index, { draft: undefined, productId: items[0]?.id ?? "", confidence: "suggested" })} disabled={!items.length}>改為配對現有產品</button></div> : <div className="matched-product"><div><span className={line.confidence === "matched" ? "match-badge" : "match-badge suggested"}>{line.confidence === "matched" ? "已配對" : "可能配對 · 請核對"}</span><button onClick={() => update(index, { draft: { ...line.original }, productId: "", confidence: "new" })}>改為新產品</button></div><label>現有產品<select value={line.productId} onChange={(event) => update(index, { productId: event.target.value, confidence: "matched" })}>{items.map((product) => <option key={product.id} value={product.id}>{product.category}｜{product.subcategory}｜{product.brand}｜{product.flavor}｜{product.spec}</option>)}</select></label></div>}<div className="review-quantity"><label>實收數量<input inputMode="numeric" value={line.quantity} onChange={(event) => { const value = event.target.value.replace(/\D/g, ""); update(index, { quantity: value === "" ? "" : Number(value) }); }} /></label><label>輸入單位<select value={line.unitMode} onChange={(event) => update(index, { unitMode: event.target.value as UnitMode })}><option value="package">箱／包</option><option value="base">{item?.unit ?? "件"}</option></select></label><div><span>自動換算</span><strong>{Number(line.quantity || 0) * (line.unitMode === "package" ? item?.pack_size ?? 0 : 1)} {item?.unit}</strong></div></div></div><button className="remove-button" onClick={() => setReview({ ...review, lines: review.lines.filter((_line, lineIndex) => lineIndex !== index) })}>×</button></article>; })}</section><footer className="review-footer"><div><span>確認後先建立新產品，再批量入貨</span><strong>{review.lines.length} 項 · {totalUnits} 件</strong></div><button className="primary-button" onClick={confirmInbound} disabled={busy || invalid || duplicate}>{busy ? "同步中…" : duplicate ? "請先處理重複產品" : "確認全部入貨"}</button></footer></div>;
+  */
 }
 
 function UploadReview({ pdf, items, setPdf, confirm, busy }: { pdf: { filename: string; orderNumber: string; lines: PdfLine[] }; items: InventoryItem[]; setPdf: (value: typeof pdf | null) => void; confirm: () => void; busy: boolean }) {
