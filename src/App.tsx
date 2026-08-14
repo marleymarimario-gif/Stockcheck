@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import type { Session } from "@supabase/supabase-js";
 import { isConfigured, supabase } from "./supabase";
 import { seedProducts } from "./catalog";
+import { downloadInboundTemplate, downloadStocktakeWorkbook, parseInboundWorkbook, parseStocktakeWorkbook } from "./excel";
 
 type InventoryItem = {
   id: string; category: string; subcategory: string; brand: string; flavor: string; name: string;
@@ -13,6 +14,7 @@ type Activity = {
   entered_quantity: number; entered_unit: string; pack_size: number; actor_id: string;
   actor: string; happened_at: string; is_corrected: boolean; original_quantity: number | null;
   original_product_name: string | null; corrected_by_email: string | null; corrected_at: string | null;
+  source: string;
 };
 type Workspace = { id: string; name: string; role: "owner" | "admin" | "member" };
 type WorkspaceMember = { user_id: string; email: string; role: string };
@@ -29,10 +31,15 @@ type NewProduct = {
   unit: string; packSize: string; initialPieces: string; lowStockLevel: string;
 };
 type OcrProgress = { label: string; percent: number };
+type ExcelInboundLine = { rowNumber: number; productId: string; quantity: number | ""; unitMode: UnitMode; confidence: "matched" | "suggested" | "new"; original: ProductDraft; draft?: ProductDraft };
+type ExcelStocktakeLine = { rowNumber: number; productId: string; quantity: number | ""; expectedQty: number; conflictQty?: number };
+type ExcelReview =
+  | { kind: "inbound"; filename: string; orderNumber: string; lines: ExcelInboundLine[] }
+  | { kind: "stocktake"; filename: string; exportedAt: string; lines: ExcelStocktakeLine[] };
 
 const today = () => new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Hong_Kong" });
 const publisherId = import.meta.env.VITE_ADSENSE_PUBLISHER_ID ?? "";
-const appVersion = "2026.08.14.13";
+const appVersion = "2026.08.14.14";
 
 function useLatestAppVersion() {
   useEffect(() => {
@@ -145,6 +152,24 @@ function PrivacyDialog({ close }: { close: () => void }) {
 }
 
 const normalizeOcr = (value: string) => value.normalize("NFKC").toLowerCase().replace(/[^\p{L}\p{N}]/gu, "");
+const excelUnitMode = (value: string): UnitMode => /箱|包|pack|box|carton/i.test(value) ? "package" : "base";
+function matchExcelProduct(row: { brand: string; flavor: string; name: string; spec: string }, items: InventoryItem[]) {
+  const wanted = { brand: normalizeOcr(row.brand), flavor: normalizeOcr(row.flavor), name: normalizeOcr(row.name), spec: normalizeOcr(row.spec) };
+  const ranked = items.map((item) => {
+    const actual = { brand: normalizeOcr(item.brand), flavor: normalizeOcr(item.flavor), name: normalizeOcr(item.name), spec: normalizeOcr(item.spec) };
+    let score = 0;
+    if (wanted.brand && actual.brand === wanted.brand) score += 25;
+    else if (wanted.brand && (actual.brand.includes(wanted.brand) || wanted.brand.includes(actual.brand))) score += 12;
+    if (wanted.flavor && actual.flavor === wanted.flavor) score += 25;
+    else if (wanted.flavor && (actual.flavor.includes(wanted.flavor) || wanted.flavor.includes(actual.flavor))) score += 12;
+    if (wanted.name && actual.name === wanted.name) score += 35;
+    else if (wanted.name && (actual.name.includes(wanted.name) || wanted.name.includes(actual.name))) score += 20;
+    if (wanted.spec && actual.spec === wanted.spec) score += 15;
+    else if (wanted.spec && (actual.spec.includes(wanted.spec) || wanted.spec.includes(actual.spec))) score += 7;
+    return { item, score };
+  }).sort((a, b) => b.score - a.score);
+  return ranked[0]?.score >= 45 ? ranked[0] : null;
+}
 const catalogItems: RecognizableProduct[] = seedProducts.map((item) => ({
   id: `catalog:${item.id}`, category: item.category, subcategory: "未分類", brand: item.brand, flavor: item.flavor,
   name: item.name, spec: item.spec, unit: item.unit, pack_size: item.packSize,
@@ -416,7 +441,11 @@ function Stockcheck({ session, workspace, workspaces, changeWorkspace, reloadWor
   const [pdf, setPdf] = useState<{ filename: string; orderNumber: string; lines: PdfLine[] } | null>(null);
   const [pdfBusy, setPdfBusy] = useState(false);
   const [ocrProgress, setOcrProgress] = useState<OcrProgress | null>(null);
+  const [excelReview, setExcelReview] = useState<ExcelReview | null>(null);
+  const [excelBusy, setExcelBusy] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
+  const inboundExcelRef = useRef<HTMLInputElement>(null);
+  const stocktakeExcelRef = useRef<HTMLInputElement>(null);
 
   const refresh = async () => {
     const [{ data: stock, error: stockError }, { data: events, error: eventError }] = await Promise.all([
@@ -467,6 +496,86 @@ function Stockcheck({ session, workspace, workspaces, changeWorkspace, reloadWor
     const { error } = await supabase.from("stock_ins").insert({ workspace_id: workspace.id, product_id: item.id, pieces: stockIn.unitMode === "package" ? enteredQuantity : 1, units_added: unitsAdded, entered_quantity: enteredQuantity, entered_unit: stockIn.unitMode === "package" ? "箱／包" : item.unit, source: stockIn.source, added_by: session.user.id, added_by_email: session.user.email });
     setBusy(null); if (error) return setToast("未能新增入貨");
     setStockIn((value) => ({ ...value, pieces: "1" })); setToast("入貨已同步到所有裝置"); await refresh();
+  };
+
+  const openInboundExcel = async (file?: File) => {
+    if (!file) return;
+    setExcelBusy(true);
+    try {
+      const rows = await parseInboundWorkbook(file);
+      const orderNumbers = [...new Set(rows.map((row) => row.orderNumber.trim()).filter(Boolean))];
+      if (orderNumbers.length > 1) throw new Error("同一份 Excel 只可以包含一個訂單編號");
+      const lines: ExcelInboundLine[] = rows.map((row) => {
+        const original: ProductDraft = { category: row.category || "其他", subcategory: row.subcategory || "未分類", brand: row.brand || "未提供", flavor: row.flavor || "未提供", name: row.name, spec: row.spec, unit: "件", pack_size: Math.max(1, row.packSize), low_stock_level: 0 };
+        const match = matchExcelProduct(row, items);
+        if (match) return { rowNumber: row.rowNumber, productId: match.item.id, quantity: row.quantity < 0 ? "" : row.quantity, unitMode: excelUnitMode(row.unit), confidence: match.score >= 75 ? "matched" : "suggested", original };
+        return { rowNumber: row.rowNumber, productId: "", quantity: row.quantity < 0 ? "" : row.quantity, unitMode: excelUnitMode(row.unit), confidence: "new", original, draft: original };
+      });
+      setExcelReview({ kind: "inbound", filename: file.name, orderNumber: orderNumbers[0] ?? "", lines });
+    } catch (error) { setToast(error instanceof Error ? error.message : "未能讀取入貨 Excel"); }
+    finally { setExcelBusy(false); if (inboundExcelRef.current) inboundExcelRef.current.value = ""; }
+  };
+
+  const openStocktakeExcel = async (file?: File) => {
+    if (!file) return;
+    setExcelBusy(true);
+    try {
+      const parsed = await parseStocktakeWorkbook(file);
+      if (parsed.workspaceId && parsed.workspaceId !== workspace.id) throw new Error("呢份 Stock Take 屬於另一間店舖");
+      const seen = new Set<string>();
+      const lines: ExcelStocktakeLine[] = parsed.rows.map((row) => {
+        const item = items.find((candidate) => candidate.id === row.productId);
+        if (!item) throw new Error(`第 ${row.rowNumber} 行產品已不存在`);
+        if (seen.has(row.productId)) throw new Error(`第 ${row.rowNumber} 行產品重複`);
+        seen.add(row.productId);
+        if (row.countedQuantity < 0) throw new Error(`第 ${row.rowNumber} 行盤點數量不正確`);
+        return { rowNumber: row.rowNumber, productId: row.productId, quantity: row.countedQuantity, expectedQty: row.exportedQuantity, conflictQty: item.current_qty !== row.exportedQuantity ? item.current_qty : undefined };
+      });
+      setExcelReview({ kind: "stocktake", filename: file.name, exportedAt: parsed.exportedAt, lines });
+    } catch (error) { setToast(error instanceof Error ? error.message : "未能讀取 Stock Take Excel"); }
+    finally { setExcelBusy(false); if (stocktakeExcelRef.current) stocktakeExcelRef.current.value = ""; }
+  };
+
+  const confirmInboundExcel = async (review: Extract<ExcelReview, { kind: "inbound" }>) => {
+    const orderNumber = review.orderNumber.trim();
+    if (!orderNumber) return setToast("請填寫訂單編號");
+    const duplicateIds = review.lines.map((line, index) => line.productId || (line.draft ? productIdentity(line.draft) : `missing:${index}`));
+    if (new Set(duplicateIds).size !== duplicateIds.length) return setToast("Excel 有重複產品，請刪除或合併後再確認");
+    setBusy("excel-inbound");
+    const existingIds = review.lines.map((line) => line.productId).filter(Boolean);
+    if (existingIds.length) {
+      const { data: duplicates, error: duplicateError } = await supabase.from("stock_ins").select("product_id").eq("workspace_id", workspace.id).eq("order_number", orderNumber).in("product_id", existingIds);
+      if (duplicateError || duplicates?.length) { setBusy(null); return setToast(duplicates?.length ? "呢張訂單已有產品入過貨，已停止重複入貨" : "未能檢查重複訂單"); }
+    }
+    const createdIds = new Map<number, string>();
+    const newLines = review.lines.filter((line) => line.draft);
+    if (newLines.length) {
+      const { data: created, error } = await supabase.from("products").insert(newLines.map((line) => ({ workspace_id: workspace.id, ...line.draft!, created_by: session.user.id }))).select("id");
+      if (error || created?.length !== newLines.length) { setBusy(null); return setToast("未能建立 Excel 入面嘅新產品，庫存未有更新"); }
+      newLines.forEach((line, index) => createdIds.set(review.lines.indexOf(line), created[index].id));
+    }
+    const rows = review.lines.map((line, index) => {
+      const item = line.draft ?? items.find((candidate) => candidate.id === line.productId)!;
+      const enteredQuantity = Number(line.quantity); const unitsAdded = line.unitMode === "package" ? enteredQuantity * item.pack_size : enteredQuantity;
+      return { workspace_id: workspace.id, product_id: line.draft ? createdIds.get(index)! : line.productId, pieces: line.unitMode === "package" ? enteredQuantity : 1, units_added: unitsAdded, entered_quantity: enteredQuantity, entered_unit: line.unitMode === "package" ? "箱／包" : item.unit, source: `Excel 入貨: ${review.filename}`, order_number: orderNumber, added_by: session.user.id, added_by_email: session.user.email };
+    });
+    const { error } = await supabase.from("stock_ins").insert(rows);
+    setBusy(null);
+    if (error) return setToast(error.code === "23505" ? "呢張訂單已經入過貨" : "未能確認 Excel 入貨");
+    setExcelReview(null); setToast(`${rows.length} 款 Excel 入貨已同步`); await refresh();
+  };
+
+  const confirmStocktakeExcel = async (review: Extract<ExcelReview, { kind: "stocktake" }>) => {
+    setBusy("excel-stocktake");
+    const { data, error: loadError } = await supabase.from("inventory_current").select("id,current_qty").eq("workspace_id", workspace.id).in("id", review.lines.map((line) => line.productId));
+    if (loadError) { setBusy(null); return setToast("未能檢查最新庫存"); }
+    const current = new Map((data ?? []).map((row) => [row.id as string, Number(row.current_qty)]));
+    const checkedLines = review.lines.map((line) => ({ ...line, conflictQty: current.get(line.productId) !== line.expectedQty ? current.get(line.productId) : undefined }));
+    if (checkedLines.some((line) => line.conflictQty !== undefined)) { setBusy(null); setExcelReview({ ...review, lines: checkedLines }); return setToast("有產品喺 Excel 匯出後被更新，請先核對衝突"); }
+    const rows = review.lines.map((line) => ({ workspace_id: workspace.id, product_id: line.productId, quantity: Number(line.quantity), entered_quantity: Number(line.quantity), entered_unit: items.find((item) => item.id === line.productId)?.unit ?? "件", stocktake_date: today(), source: `Excel 盤點: ${review.filename}`, counted_by: session.user.id, counted_by_email: session.user.email }));
+    const { error } = await supabase.from("stocktakes").insert(rows);
+    setBusy(null); if (error) return setToast("未能確認 Excel Stock Take");
+    setExcelReview(null); setToast(`${rows.length} 款 Excel 盤點已同步`); await refresh();
   };
 
   const handleDocument = async (file?: File) => {
@@ -581,13 +690,13 @@ function Stockcheck({ session, workspace, workspaces, changeWorkspace, reloadWor
     <section className="summary-card"><div><span>今日盤點</span><strong>{doneToday}<small> / {items.length}</small></strong></div><div className="progress"><i style={{ width: `${items.length ? doneToday / items.length * 100 : 0}%` }} /></div><div className="summary-row"><span>{today()}</span><span className={lowStock ? "warning" : "good"}>{lowStock ? `${lowStock} 款低存量` : "庫存正常"}</span></div></section>
     {(tab === "count" || tab === "stock") && <label className="search"><span>⌕</span><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜尋品牌、味道或產品" /></label>}
 
-    {tab === "count" && <section className="content-section"><div className="section-heading"><div><p className="eyebrow">主分類 → 子分類</p><h2>每日盤點</h2></div><span>{items.length - doneToday} 款未完成</span></div>{!items.length && <EmptyProducts open={() => setTab("inbound")} />}<div className="category-list">{groups.map(([category, products]) => { const complete = products.filter((item) => item.stocktake_date === today()).length; const open = expanded === category || Boolean(query); return <article className="category" key={category}><button className="category-head" onClick={() => setExpanded(open && !query ? null : category)}><span className="category-icon">{category.slice(0, 1)}</span><span><strong>{category}</strong><small>{subgroups(products).length} 個子分類 · {products.length} 款產品</small></span><span className={complete === products.length ? "done-pill" : "count-pill"}>{complete}/{products.length}</span><b>{open ? "−" : "+"}</b></button>{open && <div className="product-list">{subgroups(products).map(([subcategory, childProducts]) => <section className="subcategory-group" key={subcategory}><h4>{subcategory}</h4>{childProducts.map((item) => <ProductCountCard key={item.id} item={item} value={counts[item.id] ?? ""} unitMode={countUnits[item.id] ?? "base"} onUnitChange={(unitMode) => setCountUnits((all) => ({ ...all, [item.id]: unitMode }))} onChange={(value) => setCounts((all) => ({ ...all, [item.id]: value }))} onSave={() => saveCount(item)} busy={busy === item.id} />)}</section>)}</div>}</article>; })}</div></section>}
+    {tab === "count" && <section className="content-section"><div className="section-heading"><div><p className="eyebrow">主分類 → 子分類</p><h2>每日盤點</h2></div><span>{items.length - doneToday} 款未完成</span></div><div className="excel-tool-card"><div><span className="excel-badge">XLSX</span><div><strong>Excel 批量盤點</strong><p>先匯出最新清單，填寫「盤點數量」後再匯入核對。</p></div></div><div className="excel-actions"><button onClick={() => downloadStocktakeWorkbook(items, workspace.name, workspace.id, today()).catch(() => setToast("未能建立 Stock Take Excel"))} disabled={excelBusy || !items.length}>Export 今日清單</button><button onClick={() => stocktakeExcelRef.current?.click()} disabled={excelBusy}>Import Stock Take</button><input ref={stocktakeExcelRef} hidden type="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" onChange={(event) => openStocktakeExcel(event.target.files?.[0])} /></div></div>{!items.length && <EmptyProducts open={() => setTab("inbound")} />}<div className="category-list">{groups.map(([category, products]) => { const complete = products.filter((item) => item.stocktake_date === today()).length; const open = expanded === category || Boolean(query); return <article className="category" key={category}><button className="category-head" onClick={() => setExpanded(open && !query ? null : category)}><span className="category-icon">{category.slice(0, 1)}</span><span><strong>{category}</strong><small>{subgroups(products).length} 個子分類 · {products.length} 款產品</small></span><span className={complete === products.length ? "done-pill" : "count-pill"}>{complete}/{products.length}</span><b>{open ? "−" : "+"}</b></button>{open && <div className="product-list">{subgroups(products).map(([subcategory, childProducts]) => <section className="subcategory-group" key={subcategory}><h4>{subcategory}</h4>{childProducts.map((item) => <ProductCountCard key={item.id} item={item} value={counts[item.id] ?? ""} unitMode={countUnits[item.id] ?? "base"} onUnitChange={(unitMode) => setCountUnits((all) => ({ ...all, [item.id]: unitMode }))} onChange={(value) => setCounts((all) => ({ ...all, [item.id]: value }))} onSave={() => saveCount(item)} busy={busy === item.id} />)}</section>)}</div>}</article>; })}</div></section>}
 
     {tab === "stock" && <section className="content-section"><div className="section-heading"><div><p className="eyebrow">主分類 → 子分類</p><h2>庫存清單</h2></div><div className="section-actions"><span>{filtered.length} 款</span>{workspace.role !== "member" && <button className="outline-button" onClick={() => setShowCategoryManager(true)}>分類設定</button>}</div></div><div className="stock-list">{groups.map(([category, products]) => <section key={category}><h3>{category}</h3>{subgroups(products).map(([subcategory, childProducts]) => <div className="stock-subcategory" key={subcategory}><h4>{subcategory}</h4>{childProducts.map((item) => <button className="stock-row stock-edit-row" key={item.id} onClick={() => setEditingProduct(item)}><div><strong>{item.brand} · {item.flavor}</strong><span>{item.name}｜{item.spec}</span></div><div className={item.current_qty <= item.low_stock_level ? "qty low" : "qty"}><strong>{item.current_qty}</strong><small>{item.unit} · 編輯 ›</small></div></button>)}</div>)}</section>)}</div></section>}
 
-    {tab === "inbound" && <section className="content-section"><div className="section-heading"><div><p className="eyebrow">增加庫存</p><h2>新貨入庫</h2></div><button className="outline-button" onClick={() => setShowNewProduct(true)}>＋ 新增產品</button></div><div className="form-card"><label>現有產品<select value={stockIn.productId} onChange={(event) => setStockIn({ ...stockIn, productId: event.target.value })}><option value="">請選擇</option>{items.map((item) => <option value={item.id} key={item.id}>{item.category}｜{item.brand}｜{item.flavor}</option>)}</select></label><div className="quantity-unit-row"><label>新增數量<input inputMode="numeric" value={stockIn.pieces} onChange={(event) => setStockIn({ ...stockIn, pieces: event.target.value.replace(/\D/g, "") })} /></label><label>輸入單位<select value={stockIn.unitMode} onChange={(event) => setStockIn({ ...stockIn, unitMode: event.target.value as UnitMode })}><option value="package">箱／包</option><option value="base">{items.find((item) => item.id === stockIn.productId)?.unit ?? "件"}</option></select></label></div>{stockIn.productId && <div className="conversion-note">自動換算：<strong>{stockIn.unitMode === "package" ? Number(stockIn.pieces || 0) * (items.find((item) => item.id === stockIn.productId)?.pack_size ?? 0) : Number(stockIn.pieces || 0)}</strong> {items.find((item) => item.id === stockIn.productId)?.unit}</div>}<label>來源<input value={stockIn.source} onChange={(event) => setStockIn({ ...stockIn, source: event.target.value })} /></label><button className="primary-button" onClick={saveInbound} disabled={busy === "inbound"}>{busy === "inbound" ? "儲存中…" : "確認入貨"}</button></div><div className="pdf-card"><div className="pdf-icon">OCR</div><div><strong>從 PDF 或相片辨認</strong><p>支援 PDF、JPG、JPEG、PNG；完成後必須先核對，未確認唔會改庫存。</p></div><button onClick={() => fileRef.current?.click()} disabled={pdfBusy}>{pdfBusy ? `${ocrProgress?.percent ?? 0}%` : "選擇檔案"}</button><input ref={fileRef} hidden type="file" accept="application/pdf,image/jpeg,image/png,.jpg,.jpeg,.png" onChange={(event) => handleDocument(event.target.files?.[0])} /></div>{ocrProgress && <div className="ocr-progress"><div><span>{ocrProgress.label}</span><b>{ocrProgress.percent}%</b></div><i><em style={{ width: `${ocrProgress.percent}%` }} /></i><small>首次使用會下載中文及英文辨認模型，請保持網絡連線。</small></div>}</section>}
+    {tab === "inbound" && <section className="content-section"><div className="section-heading"><div><p className="eyebrow">增加庫存</p><h2>新貨入庫</h2></div><button className="outline-button" onClick={() => setShowNewProduct(true)}>＋ 新增產品</button></div><div className="form-card"><label>現有產品<select value={stockIn.productId} onChange={(event) => setStockIn({ ...stockIn, productId: event.target.value })}><option value="">請選擇</option>{items.map((item) => <option value={item.id} key={item.id}>{item.category}｜{item.brand}｜{item.flavor}</option>)}</select></label><div className="quantity-unit-row"><label>新增數量<input inputMode="numeric" value={stockIn.pieces} onChange={(event) => setStockIn({ ...stockIn, pieces: event.target.value.replace(/\D/g, "") })} /></label><label>輸入單位<select value={stockIn.unitMode} onChange={(event) => setStockIn({ ...stockIn, unitMode: event.target.value as UnitMode })}><option value="package">箱／包</option><option value="base">{items.find((item) => item.id === stockIn.productId)?.unit ?? "件"}</option></select></label></div>{stockIn.productId && <div className="conversion-note">自動換算：<strong>{stockIn.unitMode === "package" ? Number(stockIn.pieces || 0) * (items.find((item) => item.id === stockIn.productId)?.pack_size ?? 0) : Number(stockIn.pieces || 0)}</strong> {items.find((item) => item.id === stockIn.productId)?.unit}</div>}<label>來源<input value={stockIn.source} onChange={(event) => setStockIn({ ...stockIn, source: event.target.value })} /></label><button className="primary-button" onClick={saveInbound} disabled={busy === "inbound"}>{busy === "inbound" ? "儲存中…" : "確認入貨"}</button></div><div className="excel-tool-card inbound-excel"><div><span className="excel-badge">XLSX</span><div><strong>AI 訂單 Excel 入貨</strong><p>外部 AI 按固定欄位生成 Excel；Stockcheck 會自動配對產品再俾你核對。</p></div></div><div className="excel-actions"><button onClick={() => downloadInboundTemplate(workspace.name).catch(() => setToast("未能下載 Excel 範本"))} disabled={excelBusy}>下載格式範例</button><button onClick={() => inboundExcelRef.current?.click()} disabled={excelBusy}>{excelBusy ? "讀取中…" : "Import Excel"}</button><input ref={inboundExcelRef} hidden type="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" onChange={(event) => openInboundExcel(event.target.files?.[0])} /></div></div></section>}
 
-    {tab === "activity" && <section className="content-section"><div className="section-heading"><div><p className="eyebrow">可追查記錄</p><h2>最近操作</h2></div></div><div className="activity-list">{activity.length ? activity.map((entry) => { const canCorrect = entry.kind === "入貨" && (workspace.role !== "member" || entry.actor_id === session.user.id); return <div className={entry.is_corrected ? "activity-row corrected" : "activity-row"} key={`${entry.kind}-${entry.id}`}><span className={entry.kind === "盤點" ? "activity-icon count" : "activity-icon inbound"}>{entry.kind === "盤點" ? "✓" : "+"}</span><div><strong>{entry.product_name}{entry.is_corrected && <em>已更正</em>}</strong><p>{entry.actor} · {new Date(entry.happened_at).toLocaleString("zh-HK")}</p>{entry.is_corrected && <small>原本：{entry.original_product_name} +{entry.original_quantity}；由 {entry.corrected_by_email} 更正</small>}</div><aside><b>{entry.kind === "盤點" ? entry.quantity : `+${entry.quantity}`}</b>{canCorrect && <button onClick={() => setCorrectingEntry(entry)}>更正</button>}</aside></div>; }) : <div className="empty">未有操作記錄</div>}</div></section>}
+    {tab === "activity" && <section className="content-section"><div className="section-heading"><div><p className="eyebrow">可追查記錄</p><h2>最近操作</h2></div></div><div className="activity-list">{activity.length ? activity.map((entry) => { const canCorrect = entry.kind === "入貨" && (workspace.role !== "member" || entry.actor_id === session.user.id); return <div className={entry.is_corrected ? "activity-row corrected" : "activity-row"} key={`${entry.kind}-${entry.id}`}><span className={entry.kind === "盤點" ? "activity-icon count" : "activity-icon inbound"}>{entry.kind === "盤點" ? "✓" : "+"}</span><div><strong>{entry.product_name}{entry.is_corrected && <em>已更正</em>}</strong><p>{entry.source} · {entry.actor} · {new Date(entry.happened_at).toLocaleString("zh-HK")}</p>{entry.is_corrected && <small>原本：{entry.original_product_name} +{entry.original_quantity}；由 {entry.corrected_by_email} 更正</small>}</div><aside><b>{entry.kind === "盤點" ? entry.quantity : `+${entry.quantity}`}</b>{canCorrect && <button onClick={() => setCorrectingEntry(entry)}>更正</button>}</aside></div>; }) : <div className="empty">未有操作記錄</div>}</div></section>}
 
     <div className="ad-safe-gap" aria-label="Google 廣告安全區" />
     <nav className="bottom-nav">{([["count","盤點","✓"],["stock","庫存","▦"],["inbound","入貨","＋"],["activity","記錄","◷"]] as [Tab,string,string][]).map(([id,label,icon]) => <button key={id} className={tab === id ? "active" : ""} onClick={() => setTab(id)}><span>{icon}</span>{label}</button>)}</nav>
@@ -597,6 +706,7 @@ function Stockcheck({ session, workspace, workspaces, changeWorkspace, reloadWor
     {showWorkspace && <WorkspaceDialog session={session} workspace={workspace} workspaces={workspaces} changeWorkspace={changeWorkspace} reload={reloadWorkspaces} close={() => setShowWorkspace(false)} />}
     {showCategoryManager && <CategoryManager items={items} workspace={workspace} close={() => setShowCategoryManager(false)} saved={async (count, source, target) => { setToast(`${count} 款產品已搬到「${target} → ${source}」`); await refresh(); }} />}
     {pdf && <UploadReview pdf={pdf} items={items} setPdf={setPdf} confirm={confirmPdf} busy={busy === "pdf"} />}
+    {excelReview && <ExcelReviewPage review={excelReview} items={items} setReview={setExcelReview} confirmInbound={() => excelReview.kind === "inbound" && confirmInboundExcel(excelReview)} confirmStocktake={() => excelReview.kind === "stocktake" && confirmStocktakeExcel(excelReview)} busy={busy === "excel-inbound" || busy === "excel-stocktake"} />}
     {toast && <div className="toast">{toast}</div>}
   </main>;
 }
@@ -749,6 +859,22 @@ function WorkspaceDialog({ session, workspace, workspaces, changeWorkspace, relo
   };
 
   return <div className="modal-backdrop"><section className="modal workspace-modal"><div className="modal-head"><div><p className="eyebrow">Workspace</p><h2>店舖及成員</h2></div><button onClick={close}>完成</button></div><label className="workspace-picker">切換店舖<select value={workspace.id} onChange={(event) => changeWorkspace(event.target.value)}>{workspaces.map((item) => <option value={item.id} key={item.id}>{item.name}</option>)}</select></label><section className="member-panel"><div className="panel-title"><strong>{workspace.name}</strong><span>{workspace.role === "owner" ? "擁有人" : workspace.role === "admin" ? "管理員" : "成員"}</span></div>{members.map((member) => <div className="member-row" key={member.user_id}><span>{member.email}</span><b>{member.role === "owner" ? "擁有人" : member.role === "admin" ? "管理員" : "成員"}</b></div>)}</section>{canManage && <section className="workspace-form"><p className="eyebrow">邀請同事</p><div><input type="email" inputMode="email" value={inviteEmail} onChange={(event) => setInviteEmail(event.target.value)} placeholder="同事電郵" /><button onClick={invite} disabled={busy}>邀請</button></div><small>對方用相同電郵登入後，會自動加入呢間店。</small></section>}<section className="workspace-form"><p className="eyebrow">另一間獨立店舖</p><div><input value={newName} onChange={(event) => setNewName(event.target.value)} placeholder="新店舖／倉庫名稱" /><button onClick={createAnother} disabled={busy}>建立</button></div></section>{message && <p className="form-message">{message}</p>}<button className="logout-button" onClick={() => supabase.auth.signOut()}>登出 {session.user.email}</button></section></div>;
+}
+
+function ExcelReviewPage({ review, items, setReview, confirmInbound, confirmStocktake, busy }: { review: ExcelReview; items: InventoryItem[]; setReview: (review: ExcelReview | null) => void; confirmInbound: () => void; confirmStocktake: () => void; busy: boolean }) {
+  if (review.kind === "stocktake") {
+    const update = (index: number, next: Partial<ExcelStocktakeLine>) => { const lines = [...review.lines]; lines[index] = { ...lines[index], ...next }; setReview({ ...review, lines }); };
+    const conflicts = review.lines.filter((line) => line.conflictQty !== undefined).length;
+    const invalid = !review.lines.length || review.lines.some((line) => !Number.isInteger(Number(line.quantity)) || Number(line.quantity) < 0);
+    const acceptLatest = () => setReview({ ...review, lines: review.lines.map((line) => line.conflictQty === undefined ? line : { ...line, expectedQty: line.conflictQty, conflictQty: undefined }) });
+    return <div className="review-page excel-review-page"><header className="review-topbar"><button onClick={() => setReview(null)}>← 取消</button><div><p className="eyebrow">未更新庫存</p><h2>Excel 盤點核對</h2></div><span>{review.lines.length} 項</span></header><section className="review-summary"><div><span>上載檔案</span><strong>{review.filename}</strong></div>{review.exportedAt && <small>匯出時間：{new Date(review.exportedAt).toLocaleString("zh-HK")}</small>}<div className="review-totals"><span>盤點項目 <b>{review.lines.length}</b></span><span className={conflicts ? "conflict-text" : ""}>資料衝突 <b>{conflicts}</b></span></div>{conflicts > 0 && <div className="conflict-banner"><strong>其他人喺匯出後更新過庫存</strong><p>逐項核對最新數量，再接受最新資料繼續。</p><button onClick={acceptLatest}>接受最新庫存資料</button></div>}</section><section className="review-list"><div className="review-heading"><div><p className="eyebrow">逐項確認</p><h3>實際盤點數量</h3></div></div>{review.lines.map((line, index) => { const item = items.find((candidate) => candidate.id === line.productId); return <article className={line.conflictQty === undefined ? "excel-review-row" : "excel-review-row has-conflict"} key={line.productId}><div className="review-item-number">{index + 1}</div><div><strong>{item?.brand} · {item?.flavor}</strong><p>{item?.name}｜{item?.spec}</p><div className="stocktake-compare"><span>匯出時 <b>{line.expectedQty}</b></span>{line.conflictQty !== undefined && <span className="conflict-text">而家 <b>{line.conflictQty}</b></span>}<label>盤點數量<input inputMode="numeric" value={line.quantity} onChange={(event) => { const value = event.target.value.replace(/\D/g, ""); update(index, { quantity: value === "" ? "" : Number(value) }); }} /></label></div></div><button className="remove-button" onClick={() => setReview({ ...review, lines: review.lines.filter((_line, lineIndex) => lineIndex !== index) })}>×</button></article>; })}</section><footer className="review-footer"><div><span>確認後記錄為今日 Stock Take</span><strong>{review.lines.length} 款產品</strong></div><button className="primary-button" onClick={confirmStocktake} disabled={busy || invalid || conflicts > 0}>{busy ? "同步中…" : conflicts ? "請先處理衝突" : "確認全部盤點"}</button></footer></div>;
+  }
+
+  const update = (index: number, next: Partial<ExcelInboundLine>) => { const lines = [...review.lines]; lines[index] = { ...lines[index], ...next }; setReview({ ...review, lines }); };
+  const invalid = !review.orderNumber.trim() || !review.lines.length || review.lines.some((line) => !Number.isInteger(Number(line.quantity)) || Number(line.quantity) <= 0 || (!line.draft && !line.productId) || (line.draft && (![line.draft.category, line.draft.subcategory, line.draft.brand, line.draft.flavor, line.draft.name, line.draft.unit].every((value) => value.trim()) || line.draft.pack_size < 1)));
+  const identities = review.lines.map((line, index) => line.productId || (line.draft ? productIdentity(line.draft) : `missing:${index}`)); const duplicate = new Set(identities).size !== identities.length;
+  const totalUnits = review.lines.reduce((total, line) => { const item = line.draft ?? items.find((candidate) => candidate.id === line.productId); return total + Number(line.quantity || 0) * (line.unitMode === "package" ? item?.pack_size ?? 0 : 1); }, 0);
+      return <div className="review-page excel-review-page"><header className="review-topbar"><button onClick={() => setReview(null)}>← 取消</button><div><p className="eyebrow">未更新庫存</p><h2>Excel 入貨核對</h2></div><span>{review.lines.length} 項</span></header><section className="review-summary"><div><span>上載檔案</span><strong>{review.filename}</strong></div><label>訂單編號<input value={review.orderNumber} onChange={(event) => setReview({ ...review, orderNumber: event.target.value })} placeholder="必須填寫，用作防止重複入貨" /></label><div className="review-totals"><span>入貨項目 <b>{review.lines.length}</b></span><span>預計新增 <b>{totalUnits}</b> 件</span></div>{duplicate && <div className="conflict-banner"><strong>Excel 有重複產品</strong><p>請刪除重複項目，或者取消後合併數量再匯入。</p></div>}</section><section className="review-list"><div className="review-heading"><div><p className="eyebrow">自動配對結果</p><h3>產品及實收數量</h3></div></div>{review.lines.map((line, index) => { const item = line.draft ?? items.find((candidate) => candidate.id === line.productId); const updateDraft = (key: keyof ProductDraft, value: string | number) => line.draft && update(index, { draft: { ...line.draft, [key]: value } }); return <article className="review-item" key={`${line.rowNumber}-${index}`}><div className="review-item-number">{index + 1}</div><div className="review-fields">{line.draft ? <div className="generated-product"><div className="generated-product-title"><span>建立新產品</span><b>請核對</b></div><div className="two-fields"><label>主分類<input value={line.draft.category} onChange={(event) => updateDraft("category", event.target.value)} /></label><label>子分類<input value={line.draft.subcategory} onChange={(event) => updateDraft("subcategory", event.target.value)} /></label></div><div className="two-fields"><label>品牌<input value={line.draft.brand} onChange={(event) => updateDraft("brand", event.target.value)} /></label><label>味道<input value={line.draft.flavor} onChange={(event) => updateDraft("flavor", event.target.value)} /></label></div><label>產品名稱<input value={line.draft.name} onChange={(event) => updateDraft("name", event.target.value)} /></label><div className="three-fields"><label>規格<input value={line.draft.spec} onChange={(event) => updateDraft("spec", event.target.value)} /></label><label>基本單位<input value={line.draft.unit} onChange={(event) => updateDraft("unit", event.target.value)} /></label><label>每箱／包數量<input inputMode="numeric" value={line.draft.pack_size} onChange={(event) => updateDraft("pack_size", Math.max(1, Number(event.target.value.replace(/\D/g, ""))))} /></label></div><button className="mapping-switch" onClick={() => update(index, { draft: undefined, productId: items[0]?.id ?? "", confidence: "suggested" })} disabled={!items.length}>改為配對現有產品</button></div> : <div className="matched-product"><div><span className={line.confidence === "matched" ? "match-badge" : "match-badge suggested"}>{line.confidence === "matched" ? "已配對" : "可能配對 · 請核對"}</span><button onClick={() => update(index, { draft: { ...line.original }, productId: "", confidence: "new" })}>改為新產品</button></div><label>現有產品<select value={line.productId} onChange={(event) => update(index, { productId: event.target.value, confidence: "matched" })}>{items.map((product) => <option key={product.id} value={product.id}>{product.category}｜{product.subcategory}｜{product.brand}｜{product.flavor}｜{product.spec}</option>)}</select></label></div>}<div className="review-quantity"><label>實收數量<input inputMode="numeric" value={line.quantity} onChange={(event) => { const value = event.target.value.replace(/\D/g, ""); update(index, { quantity: value === "" ? "" : Number(value) }); }} /></label><label>輸入單位<select value={line.unitMode} onChange={(event) => update(index, { unitMode: event.target.value as UnitMode })}><option value="package">箱／包</option><option value="base">{item?.unit ?? "件"}</option></select></label><div><span>自動換算</span><strong>{Number(line.quantity || 0) * (line.unitMode === "package" ? item?.pack_size ?? 0 : 1)} {item?.unit}</strong></div></div></div><button className="remove-button" onClick={() => setReview({ ...review, lines: review.lines.filter((_line, lineIndex) => lineIndex !== index) })}>×</button></article>; })}</section><footer className="review-footer"><div><span>確認後先建立新產品，再批量入貨</span><strong>{review.lines.length} 項 · {totalUnits} 件</strong></div><button className="primary-button" onClick={confirmInbound} disabled={busy || invalid || duplicate}>{busy ? "同步中…" : duplicate ? "請先處理重複產品" : "確認全部入貨"}</button></footer></div>;
 }
 
 function UploadReview({ pdf, items, setPdf, confirm, busy }: { pdf: { filename: string; orderNumber: string; lines: PdfLine[] }; items: InventoryItem[]; setPdf: (value: typeof pdf | null) => void; confirm: () => void; busy: boolean }) {
