@@ -15,12 +15,26 @@ assert.equal(inboundRows[0].packSize, 12);
 const stocktake = await buildStocktakeWorkbook([{ id: "00000000-0000-0000-0000-000000000001", category: "零食", subcategory: "朱古力", brand: "M&M'S", flavor: "牛奶朱古力", name: "家庭分享裝", spec: "175.5g", unit: "件", pack_size: 12, current_qty: 20 }], "workspace-test");
 const stocktakeSheet = stocktake.getWorksheet("Stock Take");
 assert.ok(stocktakeSheet);
-stocktakeSheet.getCell("I2").value = 18;
+stocktakeSheet.getCell("J2").value = 2;
+stocktakeSheet.getCell("K2").value = 5;
 const stocktakeFile = new File([await stocktake.xlsx.writeBuffer()], "stocktake.xlsx", { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
 const parsedStocktake = await parseStocktakeWorkbook(stocktakeFile);
 assert.equal(parsedStocktake.rows.length, 1);
 assert.equal(parsedStocktake.rows[0].exportedQuantity, 20);
-assert.equal(parsedStocktake.rows[0].countedQuantity, 18);
+assert.equal(parsedStocktake.rows[0].packageQuantity, 2);
+assert.equal(parsedStocktake.rows[0].looseQuantity, 5);
+assert.equal(parsedStocktake.rows[0].countedQuantity, 29);
 assert.equal(parsedStocktake.workspaceId, "workspace-test");
+
+const ExcelJS = (await import("exceljs")).default;
+const legacy = new ExcelJS.Workbook();
+const legacySheet = legacy.addWorksheet("Stock Take");
+legacySheet.addRow(["產品ID", "匯出時庫存", "盤點數量", "單位"]);
+legacySheet.addRow(["00000000-0000-0000-0000-000000000001", 20, 18, "件"]);
+const legacyFile = new File([await legacy.xlsx.writeBuffer()], "legacy-stocktake.xlsx", { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
+const parsedLegacy = await parseStocktakeWorkbook(legacyFile);
+assert.equal(parsedLegacy.rows[0].packageQuantity, 0);
+assert.equal(parsedLegacy.rows[0].looseQuantity, 18);
+assert.equal(parsedLegacy.rows[0].countedQuantity, 18);
 
 console.log("Excel import smoke test passed");

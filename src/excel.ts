@@ -29,12 +29,14 @@ export type StocktakeExcelRow = {
   rowNumber: number;
   productId: string;
   exportedQuantity: number;
+  packageQuantity: number;
+  looseQuantity: number;
   countedQuantity: number;
   unit: string;
 };
 
 const inboundHeaders = ["品牌", "味道", "產品名稱", "規格", "數量", "單位", "訂單編號", "主分類", "子分類", "每箱／包件數"];
-const stocktakeHeaders = ["產品ID", "主分類", "子分類", "品牌", "味道", "產品名稱", "規格", "匯出時庫存", "盤點數量", "單位"];
+const stocktakeHeaders = ["產品ID", "主分類", "子分類", "品牌", "味道", "產品名稱", "規格", "匯出時庫存", "每箱／包件數", "箱／包數量", "散件數量", "盤點總數（基本單位）", "基本單位"];
 
 const safeFilename = (value: string) => value.replace(/[\\/:*?"<>|]/g, "-").trim() || "Stockcheck";
 const cellText = (cell: { text: string }) => cell.text.trim();
@@ -102,13 +104,31 @@ export async function buildStocktakeWorkbook(items: ExcelInventoryItem[], worksp
   workbook.creator = "Stockcheck";
   const sheet = workbook.addWorksheet("Stock Take");
   sheet.addRow(stocktakeHeaders);
-  items.forEach((item) => sheet.addRow([item.id, item.category, item.subcategory, item.brand, item.flavor, item.name, item.spec, item.current_qty, "", item.unit]));
-  styleWorksheet(sheet, [38, 16, 16, 18, 20, 30, 18, 14, 14, 12]);
+  items.forEach((item, index) => {
+    const row = index + 2;
+    sheet.addRow([item.id, item.category, item.subcategory, item.brand, item.flavor, item.name, item.spec, item.current_qty, item.pack_size, "", "", { formula: `IF(COUNTA(J${row}:K${row})=0,"",J${row}*I${row}+K${row})` }, item.unit]);
+  });
+  styleWorksheet(sheet, [38, 16, 16, 18, 20, 30, 18, 14, 16, 15, 14, 22, 12]);
   sheet.getColumn(1).hidden = true;
-  sheet.getColumn(8).numFmt = "0"; sheet.getColumn(9).numFmt = "0";
-  sheet.getColumn(9).eachCell((cell, row) => { if (row > 1) cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFFFF2CC" } }; });
+  [8, 9, 10, 11, 12].forEach((column) => { sheet.getColumn(column).numFmt = "0"; });
+  [10, 11].forEach((column) => sheet.getColumn(column).eachCell((cell, row) => {
+    if (row > 1) cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFFFF2CC" } };
+  }));
+  sheet.getColumn(12).eachCell((cell, row) => {
+    if (row > 1) cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFE2F0D9" } };
+  });
+  const guide = workbook.addWorksheet("填寫說明");
+  guide.addRows([
+    ["Stockcheck 混合單位盤點"],
+    ["每款產品可同時填寫整箱／整包數量及散件數量，系統會換算成基本單位。"],
+    ["例子", "每箱 12 件，填 2 箱及 5 散件，盤點總數會是 29 件。"],
+    ["只點散件", "「箱／包數量」留空，只填「散件數量」。"],
+    ["只點整箱", "「散件數量」留空，只填「箱／包數量」。"],
+    ["注意", "黃色欄位供輸入；綠色總數欄由 Excel 自動計算，匯入時 Stockcheck 亦會重新核算。"],
+  ]);
+  guide.getColumn(1).width = 18; guide.getColumn(2).width = 88; guide.getRow(1).font = { bold: true, size: 16, color: { argb: "FF123E34" } };
   const meta = workbook.addWorksheet("Stockcheck");
-  meta.addRows([["類型", "STOCKTAKE"], ["版本", "1"], ["店舖ID", workspaceId], ["匯出時間", new Date().toISOString()]]);
+  meta.addRows([["類型", "STOCKTAKE"], ["版本", "2"], ["店舖ID", workspaceId], ["匯出時間", new Date().toISOString()]]);
   meta.state = "veryHidden";
   return workbook;
 }
@@ -153,13 +173,29 @@ export async function parseStocktakeWorkbook(file: File) {
   const sheet = workbook.getWorksheet("Stock Take") ?? workbook.worksheets[0];
   if (!sheet) throw new Error("Excel 入面未有工作表");
   const headers = headerMap(sheet);
-  requireHeaders(headers, ["產品ID", "匯出時庫存", "盤點數量", "單位"]);
+  requireHeaders(headers, ["產品ID", "匯出時庫存"]);
+  const mixedUnitFormat = headers.has("箱／包數量") && headers.has("散件數量") && headers.has("每箱／包件數");
+  const legacyFormat = headers.has("盤點數量");
+  if (!mixedUnitFormat && !legacyFormat) throw new Error("Excel 缺少盤點數量欄位");
   const at = (row: import("exceljs").Row, name: string) => row.getCell(headers.get(name) ?? 9999);
   const rows: StocktakeExcelRow[] = [];
   for (let index = 2; index <= sheet.rowCount; index++) {
-    const row = sheet.getRow(index); const countedText = cellText(at(row, "盤點數量"));
+    const row = sheet.getRow(index);
+    if (mixedUnitFormat) {
+      const packageText = cellText(at(row, "箱／包數量"));
+      const looseText = cellText(at(row, "散件數量"));
+      if (packageText === "" && looseText === "") continue;
+      const packageQuantity = packageText === "" ? 0 : cellInteger(at(row, "箱／包數量"), -1);
+      const looseQuantity = looseText === "" ? 0 : cellInteger(at(row, "散件數量"), -1);
+      const packSize = cellInteger(at(row, "每箱／包件數"), -1);
+      const countedQuantity = packageQuantity < 0 || looseQuantity < 0 || packSize < 1 ? -1 : packageQuantity * packSize + looseQuantity;
+      rows.push({ rowNumber: index, productId: cellText(at(row, "產品ID")), exportedQuantity: cellInteger(at(row, "匯出時庫存"), -1), packageQuantity, looseQuantity, countedQuantity, unit: cellText(at(row, "基本單位")) });
+      continue;
+    }
+    const countedText = cellText(at(row, "盤點數量"));
     if (countedText === "") continue;
-    rows.push({ rowNumber: index, productId: cellText(at(row, "產品ID")), exportedQuantity: cellInteger(at(row, "匯出時庫存"), -1), countedQuantity: cellInteger(at(row, "盤點數量"), -1), unit: cellText(at(row, "單位")) });
+    const countedQuantity = cellInteger(at(row, "盤點數量"), -1);
+    rows.push({ rowNumber: index, productId: cellText(at(row, "產品ID")), exportedQuantity: cellInteger(at(row, "匯出時庫存"), -1), packageQuantity: 0, looseQuantity: countedQuantity, countedQuantity, unit: cellText(at(row, "單位")) });
   }
   if (!rows.length) throw new Error("未填寫任何盤點數量");
   const meta = workbook.getWorksheet("Stockcheck");
