@@ -23,6 +23,7 @@ type Workspace = { id: string; name: string; role: WorkspaceRole };
 type WorkspaceMember = { user_id: string; email: string; role: WorkspaceRole };
 type Tab = "count" | "stock" | "inbound" | "activity";
 type UnitMode = "package" | "base";
+type StockDisplayMode = "mixed" | "base" | "package";
 type ProductDraft = {
   category: string; subcategory: string; brand: string; flavor: string; name: string; spec: string;
   unit: string; pack_size: number; low_stock_level: number;
@@ -42,8 +43,17 @@ type ExcelReview =
 
 const today = () => new Date().toLocaleDateString("en-CA", { timeZone: "Asia/Hong_Kong" });
 const publisherId = import.meta.env.VITE_ADSENSE_PUBLISHER_ID ?? "";
-const appVersion = "2026.08.15.18";
+const appVersion = "2026.08.15.19";
 const roleLabel = (role: WorkspaceRole) => role === "owner" ? "擁有人" : role === "admin" ? "管理員" : role === "viewer" ? "只供查看" : "一般成員";
+const stockDisplay = (item: InventoryItem, mode: StockDisplayMode) => {
+  if (mode === "base" || item.pack_size < 1) return { value: String(item.current_qty), unit: item.unit };
+  if (mode === "package") return { value: new Intl.NumberFormat("zh-HK", { maximumFractionDigits: 2 }).format(item.current_qty / item.pack_size), unit: "箱／包" };
+  const packages = Math.floor(item.current_qty / item.pack_size);
+  const loose = item.current_qty % item.pack_size;
+  if (!packages) return { value: String(loose), unit: item.unit };
+  if (!loose) return { value: String(packages), unit: "箱／包" };
+  return { value: `${packages} 箱／包 + ${loose}`, unit: item.unit };
+};
 
 function useLatestAppVersion() {
   useEffect(() => {
@@ -431,6 +441,7 @@ function Stockcheck({ session, workspace, workspaces, changeWorkspace, reloadWor
   const [activity, setActivity] = useState<Activity[]>([]);
   const [tab, setTab] = useState<Tab>("count");
   const [query, setQuery] = useState("");
+  const [stockDisplayMode, setStockDisplayMode] = useState<StockDisplayMode>("mixed");
   const [expanded, setExpanded] = useState<string | null>(null);
   const [counts, setCounts] = useState<Record<string, string>>({});
   const [countUnits, setCountUnits] = useState<Record<string, UnitMode>>({});
@@ -463,6 +474,10 @@ function Stockcheck({ session, workspace, workspaces, changeWorkspace, reloadWor
     if (!stockIn.productId && next[0]) setStockIn((value) => ({ ...value, productId: next[0].id }));
   };
 
+  useEffect(() => {
+    const saved = localStorage.getItem(`stockcheck:stock-display:${workspace.id}`);
+    setStockDisplayMode(saved === "base" || saved === "package" || saved === "mixed" ? saved : "mixed");
+  }, [workspace.id]);
   useEffect(() => { setItems([]); setActivity([]); setStockIn((value) => ({ ...value, productId: "" })); refresh().catch(() => setToast("未能載入共享庫存，請稍後再試")); }, [workspace.id]);
   useEffect(() => { if (workspace.role === "viewer" && (tab === "count" || tab === "inbound")) setTab("stock"); }, [workspace.id, workspace.role, tab]);
   useEffect(() => { if (!toast) return; const timer = setTimeout(() => setToast(""), 3000); return () => clearTimeout(timer); }, [toast]);
@@ -705,7 +720,7 @@ function Stockcheck({ session, workspace, workspaces, changeWorkspace, reloadWor
 
     {tab === "count" && <section className="content-section"><div className="section-heading"><div><p className="eyebrow">主分類 → 子分類</p><h2>每日盤點</h2></div><span>{items.length - doneToday} 款未完成</span></div><div className="excel-tool-card"><div><span className="excel-badge">XLSX</span><div><strong>Excel 批量盤點</strong><p>匯出後可同時填「箱／包數量」及「散件數量」，Import 時會自動換算。</p></div></div><div className="excel-actions"><button onClick={() => downloadStocktakeWorkbook(items, workspace.name, workspace.id, today()).catch(() => setToast("未能建立 Stock Take Excel"))} disabled={excelBusy || !items.length}>Export 今日清單</button><button onClick={() => stocktakeExcelRef.current?.click()} disabled={excelBusy}>Import Stock Take</button><input ref={stocktakeExcelRef} hidden type="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" onChange={(event) => openStocktakeExcel(event.target.files?.[0])} /></div></div>{!items.length && <EmptyProducts open={() => setTab("inbound")} />}<div className="category-list">{groups.map(([category, products]) => { const complete = products.filter((item) => item.stocktake_date === today()).length; const open = expanded === category || Boolean(query); return <article className="category" key={category}><button className="category-head" onClick={() => setExpanded(open && !query ? null : category)}><span className="category-icon">{category.slice(0, 1)}</span><span><strong>{category}</strong><small>{subgroups(products).length} 個子分類 · {products.length} 款產品</small></span><span className={complete === products.length ? "done-pill" : "count-pill"}>{complete}/{products.length}</span><b>{open ? "−" : "+"}</b></button>{open && <div className="product-list">{subgroups(products).map(([subcategory, childProducts]) => <section className="subcategory-group" key={subcategory}><h4>{subcategory}</h4>{childProducts.map((item) => <ProductCountCard key={item.id} item={item} value={counts[item.id] ?? ""} unitMode={countUnits[item.id] ?? "base"} onUnitChange={(unitMode) => setCountUnits((all) => ({ ...all, [item.id]: unitMode }))} onChange={(value) => setCounts((all) => ({ ...all, [item.id]: value }))} onSave={() => saveCount(item)} busy={busy === item.id} />)}</section>)}</div>}</article>; })}</div></section>}
 
-    {tab === "stock" && <section className="content-section"><div className="section-heading"><div><p className="eyebrow">主分類 → 子分類</p><h2>庫存清單</h2></div><div className="section-actions"><span>{filtered.length} 款</span>{canAdmin && <button className="outline-button" onClick={() => setShowCategoryManager(true)}>分類設定</button>}</div></div><div className="stock-list">{groups.map(([category, products]) => <section key={category}><h3>{category}</h3>{subgroups(products).map(([subcategory, childProducts]) => <div className="stock-subcategory" key={subcategory}><h4>{subcategory}</h4>{childProducts.map((item) => <button className="stock-row stock-edit-row" key={item.id} onClick={() => canAdmin && setEditingProduct(item)} disabled={!canAdmin}><div><strong>{item.brand} · {item.flavor}</strong><span>{item.name}｜{item.spec}</span></div><div className={item.current_qty <= item.low_stock_level ? "qty low" : "qty"}><strong>{item.current_qty}</strong><small>{item.unit}{canAdmin ? " · 編輯 ›" : ""}</small></div></button>)}</div>)}</section>)}</div></section>}
+    {tab === "stock" && <section className="content-section"><div className="section-heading stock-heading"><div><p className="eyebrow">主分類 → 子分類</p><h2>庫存清單</h2></div><div className="section-actions"><label className="stock-unit-picker"><span>顯示單位</span><select value={stockDisplayMode} onChange={(event) => { const mode = event.target.value as StockDisplayMode; setStockDisplayMode(mode); localStorage.setItem(`stockcheck:stock-display:${workspace.id}`, mode); }}><option value="mixed">箱／包 + 散件</option><option value="base">基本單位</option><option value="package">箱／包（小數）</option></select></label><span>{filtered.length} 款</span>{canAdmin && <button className="outline-button" onClick={() => setShowCategoryManager(true)}>分類設定</button>}</div></div><div className="stock-list">{groups.map(([category, products]) => <section key={category}><h3>{category}</h3>{subgroups(products).map(([subcategory, childProducts]) => <div className="stock-subcategory" key={subcategory}><h4>{subcategory}</h4>{childProducts.map((item) => { const display = stockDisplay(item, stockDisplayMode); return <button className="stock-row stock-edit-row" key={item.id} onClick={() => canAdmin && setEditingProduct(item)} disabled={!canAdmin}><div><strong>{item.brand} · {item.flavor}</strong><span>{item.name}｜{item.spec}｜每箱／包 {item.pack_size} {item.unit}</span></div><div className={item.current_qty <= item.low_stock_level ? "qty low" : "qty"}><strong>{display.value}</strong><small>{display.unit}{canAdmin ? " · 編輯 ›" : ""}</small></div></button>; })}</div>)}</section>)}</div></section>}
 
     {tab === "inbound" && canWrite && <section className="content-section"><div className="section-heading"><div><p className="eyebrow">增加庫存</p><h2>新貨入庫</h2></div>{canAdmin && <button className="outline-button" onClick={() => setShowNewProduct(true)}>＋ 新增產品</button>}</div><div className="form-card"><label>現有產品<select value={stockIn.productId} onChange={(event) => setStockIn({ ...stockIn, productId: event.target.value })}><option value="">請選擇</option>{items.map((item) => <option value={item.id} key={item.id}>{item.category}｜{item.brand}｜{item.flavor}</option>)}</select></label><div className="quantity-unit-row"><label>新增數量<input inputMode="numeric" value={stockIn.pieces} onChange={(event) => setStockIn({ ...stockIn, pieces: event.target.value.replace(/\D/g, "") })} /></label><label>輸入單位<select value={stockIn.unitMode} onChange={(event) => setStockIn({ ...stockIn, unitMode: event.target.value as UnitMode })}><option value="package">箱／包</option><option value="base">{items.find((item) => item.id === stockIn.productId)?.unit ?? "件"}</option></select></label></div>{stockIn.productId && <div className="conversion-note">自動換算：<strong>{stockIn.unitMode === "package" ? Number(stockIn.pieces || 0) * (items.find((item) => item.id === stockIn.productId)?.pack_size ?? 0) : Number(stockIn.pieces || 0)}</strong> {items.find((item) => item.id === stockIn.productId)?.unit}</div>}<label>來源<input value={stockIn.source} onChange={(event) => setStockIn({ ...stockIn, source: event.target.value })} /></label><button className="primary-button" onClick={saveInbound} disabled={busy === "inbound"}>{busy === "inbound" ? "儲存中…" : "確認入貨"}</button></div><div className="excel-tool-card inbound-excel"><div><span className="excel-badge">XLSX</span><div><strong>AI 訂單 Excel 入貨</strong><p>外部 AI 按固定欄位生成 Excel；Stockcheck 會自動配對產品再俾你核對。</p></div></div><div className="excel-actions"><button onClick={() => downloadInboundTemplate(workspace.name).catch(() => setToast("未能下載 Excel 範本"))} disabled={excelBusy}>下載格式範例</button><button onClick={() => inboundExcelRef.current?.click()} disabled={excelBusy}>{excelBusy ? "讀取中…" : "Import Excel"}</button><input ref={inboundExcelRef} hidden type="file" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" onChange={(event) => openInboundExcel(event.target.files?.[0])} /></div></div></section>}
 
